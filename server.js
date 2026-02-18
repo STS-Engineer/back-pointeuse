@@ -23,7 +23,7 @@ const corsOptions = {
       'http://127.0.0.1:8080',
       'http://127.0.0.1:3000',
       'http://localhost:8081',
-      'https://pointeuse-sts.azurewebsites.net/',
+      'https://pointeuse-sts.azurewebsites.net',
       'http://localhost:4200',
       'http://localhost:5173',
       'http://localhost:3001'
