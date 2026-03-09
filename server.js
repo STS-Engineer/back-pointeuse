@@ -9,13 +9,13 @@ const cron = require('node-cron');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Import des routes
+// Import routes
 const attendanceRoutes = require('./routes/attendance');
+const { setZktecoService } = require('./routes/attendance');
 
-// Configuration CORS étendue
+// CORS configuration
 const corsOptions = {
   origin: function (origin, callback) {
-    // Liste des origines autorisées
     const allowedOrigins = [
       'http://localhost:8080',
       'http://localhost:3000',
@@ -28,8 +28,6 @@ const corsOptions = {
       'http://localhost:5173',
       'http://localhost:3001'
     ];
-    
-    // En développement, autoriser toutes les origines
     if (process.env.NODE_ENV === 'development') {
       callback(null, true);
     } else if (!origin || allowedOrigins.indexOf(origin) !== -1) {
@@ -40,35 +38,21 @@ const corsOptions = {
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH', 'HEAD'],
   allowedHeaders: [
-    'Origin',
-    'X-Requested-With',
-    'Content-Type',
-    'Accept',
-    'Authorization',
-    'X-Access-Token',
-    'X-Key',
-    'X-Forwarded-For',
-    'X-Forwarded-Proto',
-    'Cache-Control',
-    'Pragma',
-    'If-Modified-Since'
+    'Origin', 'X-Requested-With', 'Content-Type', 'Accept',
+    'Authorization', 'X-Access-Token', 'X-Key', 'X-Forwarded-For',
+    'X-Forwarded-Proto', 'Cache-Control', 'Pragma', 'If-Modified-Since'
   ],
   exposedHeaders: [
-    'Content-Range',
-    'X-Content-Range',
-    'X-Total-Count',
-    'Link',
-    'X-RateLimit-Limit',
-    'X-RateLimit-Remaining',
-    'X-RateLimit-Reset'
+    'Content-Range', 'X-Content-Range', 'X-Total-Count',
+    'Link', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'
   ],
   credentials: true,
   preflightContinue: false,
   optionsSuccessStatus: 204,
-  maxAge: 86400 // 24 heures
+  maxAge: 86400
 };
 
-// Middlewares de sécurité
+// Security middlewares
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -86,67 +70,52 @@ app.use(helmet({
 
 app.use(compression());
 app.use(morgan('dev'));
-
-// Middleware CORS
 app.use(cors(corsOptions));
-
-// Gérer manuellement les pré-vérifications OPTIONS
 app.options('*', cors(corsOptions));
 
-// Middleware pour ajouter des headers CORS à toutes les réponses
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  const allowedOrigins = corsOptions.origin;
-  
-  if (typeof allowedOrigins === 'function') {
-    allowedOrigins(origin, (err, allowed) => {
-      if (!err && allowed) {
-        res.header('Access-Control-Allow-Origin', origin);
-      }
-    });
-  } else if (Array.isArray(allowedOrigins) && allowedOrigins.includes(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else if (allowedOrigins === true) {
-    res.header('Access-Control-Allow-Origin', origin || '*');
-  }
-  
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Access-Token');
   res.header('Access-Control-Allow-Credentials', 'true');
   res.header('Access-Control-Expose-Headers', 'Content-Range, X-Content-Range, X-Total-Count');
   res.header('Access-Control-Max-Age', '86400');
-  
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-  
+  if (req.method === 'OPTIONS') return res.status(200).end();
   next();
 });
 
-// Body parsers
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Routes
 app.use('/api', attendanceRoutes);
 
-// Routes de santé et d'information
+// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
     service: 'ZKTeco Attendance API',
-    version: '2.0.0',
+    version: '2.1.0',
     environment: process.env.NODE_ENV || 'development',
     uptime: process.uptime(),
-    memory: process.memoryUsage()
+    memory: process.memoryUsage(),
+    device: {
+      ip: process.env.ZKTECO_IP || '41.224.4.231',
+      port: process.env.ZKTECO_PORT || 4370
+    }
   });
 });
 
 app.get('/api/info', (req, res) => {
   res.json({
     service: 'ZKTeco Attendance System API',
-    version: '2.0.0',
+    version: '2.1.0',
+    device: {
+      ip: process.env.ZKTECO_IP || '41.224.4.231',
+      port: process.env.ZKTECO_PORT || 4370,
+      note: 'Requires port forwarding: router port 4370 → 10.10.205.10:4370'
+    },
     endpoints: {
       attendance: '/api/attendance',
       users: '/api/users',
@@ -155,49 +124,25 @@ app.get('/api/info', (req, res) => {
       refresh: '/api/refresh',
       byDate: '/api/by-date/:date',
       byEmployee: '/api/by-employee/:uid',
-      debug: '/api/debug/*'
-    },
-    cors: {
-      enabled: true,
-      allowedOrigins: corsOptions.origin,
-      credentials: true
     }
   });
 });
 
-// Route 404
+// 404 handler
 app.use('*', (req, res) => {
   res.status(404).json({
     error: 'Route not found',
     path: req.originalUrl,
-    method: req.method,
-    availableEndpoints: [
-      '/health',
-      '/api/info',
-      '/api/attendance',
-      '/api/users',
-      '/api/logs',
-      '/api/summary',
-      '/api/refresh',
-      '/api/by-date/:date',
-      '/api/by-employee/:uid',
-      '/api/debug/*'
-    ]
+    method: req.method
   });
 });
 
-// Gestionnaire d'erreurs global
+// Global error handler
 app.use((err, req, res, next) => {
   console.error('Global error handler:', err);
-  
   if (err.name === 'CorsError') {
-    return res.status(403).json({
-      error: 'CORS Error',
-      message: 'Origin not allowed',
-      requestedOrigin: req.headers.origin
-    });
+    return res.status(403).json({ error: 'CORS Error', message: 'Origin not allowed' });
   }
-  
   res.status(err.status || 500).json({
     error: err.name || 'Internal Server Error',
     message: err.message || 'Something went wrong',
@@ -205,131 +150,120 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Initialisation du service ZKTeco
+// ── ZKTeco Service initialization ─────────────────────────────
+// Uses public IP — requires port forwarding on office router:
+//   port 4370 → 10.10.205.10:4370
+// ──────────────────────────────────────────────────────────────
 let zktecoService;
 try {
   const ZktecoService = require('./zkteco-service');
-  zktecoService = new ZktecoService('10.10.205.10', 4370, 5200, 5000);
-  
-  // Planifier la récupération automatique toutes les 5 minutes
+  const zktecoIp   = process.env.ZKTECO_IP   || '41.224.4.231';
+  const zktecoPort = parseInt(process.env.ZKTECO_PORT) || 4370;
+
+  zktecoService = new ZktecoService(zktecoIp, zktecoPort, 5200, 5000);
+
+  // ✅ Share the single instance with routes (no duplicate connections)
+  setZktecoService(zktecoService);
+
+  // Auto-fetch every 5 minutes
   cron.schedule('*/5 * * * *', async () => {
-    console.log('\n=== Récupération automatique des données de la pointeuse... ===');
+    console.log('\n=== Auto-fetch from ZKTeco device ===');
     try {
       await zktecoService.fetchAllData();
-      console.log('=== Récupération automatique terminée avec succès ===\n');
+      console.log('=== Auto-fetch completed successfully ===\n');
     } catch (error) {
-      console.error('=== Erreur lors de la récupération automatique:', error.message, '===\n');
+      console.error('=== Auto-fetch failed:', error.message, '===\n');
     }
   });
-  
-  // Initialiser la connexion au démarrage
+
+  // Initial connection
   (async () => {
-    console.log('=== Initialisation du service ZKTeco ===');
+    console.log('=== Initializing ZKTeco service ===');
+    console.log(`=== Device: ${zktecoIp}:${zktecoPort} ===`);
     try {
       await zktecoService.initialize();
-      console.log('=== Service ZKTeco initialisé avec succès ===');
-      
-      // Attendre avant la première récupération
+      console.log('=== ZKTeco service initialized ===');
+
       setTimeout(async () => {
         try {
-          console.log('=== Récupération des données initiales... ===');
+          console.log('=== Fetching initial data... ===');
           const result = await zktecoService.fetchAllData();
-          console.log('=== Données initiales récupérées avec succès ===');
-          console.log('Utilisateurs:', result.usersCount);
+          console.log('=== Initial data fetched ===');
+          console.log('Users:', result.usersCount);
           console.log('Logs:', result.logsCount);
-          console.log('Données traitées:', result.processedCount);
-          console.log('Données réelles:', result.isRealData ? 'OUI' : 'NON (fictives)');
+          console.log('Processed:', result.processedCount);
+          console.log('Real data:', result.isRealData ? 'YES ✅' : 'NO ❌');
         } catch (error) {
-          console.error('=== Erreur lors de la récupération des données initiales ===');
+          console.error('=== Initial fetch failed ===');
           console.error('Message:', error.message);
+          console.error('👉 Check port forwarding: router port 4370 → 10.10.205.10:4370');
         }
       }, 3000);
+
     } catch (error) {
-      console.error('=== Erreur lors de l\'initialisation ===');
+      console.error('=== ZKTeco initialization failed ===');
       console.error('Message:', error.message);
+      console.error('👉 Check port forwarding: router port 4370 → 10.10.205.10:4370');
     }
   })();
-  
+
 } catch (error) {
-  console.error('=== Erreur lors du chargement du service ZKTeco ===');
+  console.error('=== Failed to load ZKTeco service ===');
   console.error('Message:', error.message);
-  console.error('Stack:', error.stack);
 }
 
-// Gestion des erreurs non capturées
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('=== Unhandled Rejection ===');
-  console.error('Reason:', reason);
-  console.error('Promise:', promise);
+// Unhandled errors
+process.on('unhandledRejection', (reason) => {
+  console.error('=== Unhandled Rejection ===', reason);
 });
-
 process.on('uncaughtException', (error) => {
-  console.error('=== Uncaught Exception ===');
-  console.error('Error:', error);
-  console.error('Stack:', error.stack);
+  console.error('=== Uncaught Exception ===', error);
   process.exit(1);
 });
 
-// Démarrer le serveur
+// Start server
 const server = app.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════════╗
 ║        BACKEND API ZKTECO ATTENDANCE SYSTEM          ║
+║                    v2.1.0                            ║
 ╚══════════════════════════════════════════════════════╝
-  
-  📍 Server running on: http://localhost:${PORT}
-  📡 API Base URL: http://localhost:${PORT}/api
-  🩺 Health check: http://localhost:${PORT}/health
+
+  📍 Server: http://localhost:${PORT}
   🔧 Environment: ${process.env.NODE_ENV || 'development'}
-  🕐 Started at: ${new Date().toISOString()}
-  
-  === Endpoints disponibles: ===
-  📊 Health: http://localhost:${PORT}/health
-  📋 Info: http://localhost:${PORT}/api/info
-  👥 Users: http://localhost:${PORT}/api/users
-  📝 Logs: http://localhost:${PORT}/api/logs
-  📈 Summary: http://localhost:${PORT}/api/summary
-  🔄 Refresh: http://localhost:${PORT}/api/refresh
-  📅 By Date: http://localhost:${PORT}/api/by-date/:date
-  👤 By Employee: http://localhost:${PORT}/api/by-employee/:uid
-  🐛 Debug: http://localhost:${PORT}/api/debug/*
-  🧪 CORS Test: http://localhost:${PORT}/api/cors-test
-  
-  === CORS Configuration ===
-  ✅ CORS Enabled
-  ✅ Credentials Allowed
-  ✅ Multiple Origins Supported
-  ✅ Preflight Handling
-  
-  ======================================
+  🕐 Started: ${new Date().toISOString()}
+  📡 ZKTeco device: ${process.env.ZKTECO_IP || '41.224.4.231'}:${process.env.ZKTECO_PORT || 4370}
+
+  ⚠️  REQUIRES: Port forwarding on office router
+      Router port 4370 → 10.10.205.10:4370
+
+  === Endpoints ===
+  🩺 Health:       http://localhost:${PORT}/health
+  👥 Users:        http://localhost:${PORT}/api/users
+  📝 Logs:         http://localhost:${PORT}/api/logs
+  📈 Summary:      http://localhost:${PORT}/api/summary
+  🔄 Refresh:      http://localhost:${PORT}/api/refresh
+  📅 By Date:      http://localhost:${PORT}/api/by-date/:date
+  👤 By Employee:  http://localhost:${PORT}/api/by-employee/:uid
   `);
 });
 
-// Gestion de l'arrêt propre
+// Graceful shutdown
 const shutdown = (signal) => {
-  console.log(`\n📴 Received ${signal}. Shutting down gracefully...`);
-  
+  console.log(`\n📴 ${signal} received. Shutting down...`);
   if (zktecoService) {
-    zktecoService.disconnect().then(() => {
-      console.log('✅ ZKTeco service disconnected');
-    }).catch(err => {
-      console.error('❌ Error disconnecting ZKTeco:', err.message);
+    zktecoService.disconnect().catch(err => {
+      console.error('❌ Disconnect error:', err.message);
     });
   }
-  
   server.close(() => {
-    console.log('✅ HTTP server closed');
+    console.log('✅ Server closed');
     process.exit(0);
   });
-  
-  // Force shutdown after 10 seconds
-  setTimeout(() => {
-    console.error('❌ Could not close connections in time, forcefully shutting down');
-    process.exit(1);
-  }, 10000);
+  setTimeout(() => process.exit(1), 10000);
 };
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
 
 module.exports = { app, server, zktecoService };
