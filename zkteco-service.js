@@ -35,21 +35,21 @@ class ZktecoService {
             { uid: 29, name: 'Chiraz Ben Abbes',          matricule: '29', pointeuseUserId: '40029' },
             { uid: 30, name: 'Yassine Chtiti',            matricule: '30', pointeuseUserId: '40030' },
             { uid: 33, name: 'Manel Saad',                matricule: '33', pointeuseUserId: '40033' },
-            { uid: 34, name: 'Wala Ferchichi',            matricule: '34', pointeuseUserId: '40034' },
+            // uid 34 Wala Ferchichi — REMOVED (left company)
             { uid: 35, name: 'Mohamed Laith Ben Mabrouk', matricule: '35', pointeuseUserId: '40035' },
             { uid: 36, name: 'Mohamed Baraketi',          matricule: '36', pointeuseUserId: '40036' },
             { uid: 37, name: 'Sirine Khalfallah',         matricule: '37', pointeuseUserId: '40037' },
             { uid: 39, name: 'Oumaya Bouni',              matricule: '39', pointeuseUserId: '40039' },
             { uid: 40, name: 'Maher Elhaj',               matricule: '40', pointeuseUserId: '40040' },
             { uid: 41, name: 'Moemen Ltifi',              matricule: '41', pointeuseUserId: '40041' },
-            { uid: 42, name: 'Majed Messai',              matricule: '42', pointeuseUserId: '40042' },
+            // uid 42 Majed Messai — REMOVED (left company)
             { uid: 43, name: 'Mohamed Baazaoui',          matricule: '43', pointeuseUserId: '40043' },
-            { uid: 44, name: 'Sami Benromdhan',           matricule: '44', pointeuseUserId: '40044' },
+            // uid 44 Sami Benromdhan — REMOVED (left company)
             { uid: 45, name: 'Wassim Belhadjsalah',       matricule: '45', pointeuseUserId: '40045' },
             { uid: 46, name: 'Emna Baroumi',              matricule: '46', pointeuseUserId: '40046' },
             { uid: 47, name: 'Rami Mejri',                matricule: '47', pointeuseUserId: '40047' },
             { uid: 48, name: 'Hayfa Rahji',               matricule: '48', pointeuseUserId: '40048' },
-            { uid: 49, name: 'Jihen Ben Yahmed',          matricule: '49', pointeuseUserId: '40049' },
+            // uid 49 Jihen Ben Yahmed — REMOVED (left company)
             { uid: 50, name: 'Elyes Khelili',             matricule: '50', pointeuseUserId: '40050' },
             { uid: 51, name: 'Nour Sellami',              matricule: '51', pointeuseUserId: '40051' },
             { uid: 52, name: 'Mohamed Mohsen Khefacha',   matricule: '52', pointeuseUserId: '40052' },
@@ -57,6 +57,11 @@ class ZktecoService {
             { uid: 54, name: 'Rihem Arfaoui',             matricule: '54', pointeuseUserId: '40054' },
             { uid: 55, name: 'Ons Ghariani',              matricule: '55', pointeuseUserId: '40055' },
             { uid: 56, name: 'SIHEM DJERIDI',             matricule: '56', pointeuseUserId: '40056' },
+            // NEW EMPLOYEES
+            { uid: 57, name: 'Marwa Saoudi',              matricule: '57', pointeuseUserId: '40057' },
+            { uid: 58, name: 'Sondes Rahmouni',           matricule: '58', pointeuseUserId: '40058' },
+            { uid: 59, name: 'Haythem Debbich',           matricule: '59', pointeuseUserId: '40059' },
+            { uid: 60, name: 'Eya Grati',                 matricule: '60', pointeuseUserId: '40060' },
         ];
         
         // Maps pour recherche rapide
