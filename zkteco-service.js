@@ -146,7 +146,9 @@ class ZktecoService {
             console.log('✅ Connected to ZKTeco device');
             return true;
         } catch (error) {
-            console.error('❌ Cannot reach ZKTeco device:', error.message);
+            // ✅ FIX 1 — capture any error type, not just Error instances
+            const errMsg1 = error?.message || error?.toString() || JSON.stringify(error) || 'unknown';
+            console.error('❌ Cannot reach ZKTeco device:', errMsg1);
             console.error('   Make sure port forwarding is configured on your router');
             console.error(`   Device: ${this.ip}:${this.port}`);
             this.isConnected = false;
@@ -254,9 +256,10 @@ class ZktecoService {
             };
 
         } catch (error) {
-            console.error('❌ Error fetching data from ZKTeco:', error.message);
-            // ✅ No mock data — throw the real error
-            throw new Error(`ZKTeco unreachable: ${error.message}. Check port forwarding on router (port 4370 → 10.10.205.10).`);
+            // ✅ FIX 2 — capture any error type, not just Error instances
+            const errMsg = error?.message || error?.toString() || JSON.stringify(error) || 'unknown';
+            console.error('❌ Error fetching data from ZKTeco:', errMsg);
+            throw new Error(`ZKTeco unreachable: ${errMsg}. Check port forwarding on router (port 4370 → 10.10.205.10).`);
         }
     }
 
