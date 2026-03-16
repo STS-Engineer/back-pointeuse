@@ -35,7 +35,7 @@ class ZktecoService {
         this.users = [];
         this.attendanceLogs = [];
         this.processedData = [];
-        this.realEmployees = []; // loaded from HR DB — no more hardcoded list
+        this.realEmployees = []; // loaded from HR DB
 
         // Lookup maps
         this.matriculeMap = {};
@@ -114,7 +114,7 @@ class ZktecoService {
         }
     }
 
-    // ── Employee lookup strategies (unchanged) ────────────────
+    // ── Employee lookup strategies ────────────────
     extractUserId(log) {
         const possibleFields = ['enrollNumber', 'PIN', 'user_id', 'userId', 'userid', 'uid'];
         for (const field of possibleFields) {
