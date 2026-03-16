@@ -5,9 +5,27 @@ const helmet = require('helmet');
 const compression = require('compression');
 const morgan = require('morgan');
 const cron = require('node-cron');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ── Database Pools ─────────────────────────────────────────────
+// Attendance DB — stores raw logs, daily records, employees mirror
+const pool = new Pool({
+  connectionString: 'postgresql://administrationSTS:St$@0987@avo-adb-002.postgres.database.azure.com:5432/attendance?sslmode=require',
+  ssl: { rejectUnauthorized: false },
+});
+
+// HR DB — source of truth for active employees (statut = 'actif')
+const hrPool = new Pool({
+  connectionString: 'postgresql://administrationSTS:St$@0987@avo-adb-002.postgres.database.azure.com:5432/rh_application?sslmode=require',
+  ssl: { rejectUnauthorized: false },
+});
+
+// Make pools available to zkteco-service via global so no db.js needed
+global.attendancePool = pool;
+global.hrPool = hrPool;
 
 // Import routes
 const attendanceRoutes = require('./routes/attendance');
@@ -87,6 +105,60 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
+// ============================================================
+// BACKWARD COMPATIBILITY MIDDLEWARE
+// ============================================================
+app.use((req, res, next) => {
+  const originalJson = res.json;
+  res.json = function(data) {
+    if (Array.isArray(data)) {
+      data = data.map(item => {
+        if (item.uid !== undefined) {
+          return {
+            userid: item.userid || item.userId || item.uid?.toString(),
+            ...item,
+            role: item.role ?? 0,
+            password: item.password ?? '',
+            deviceData: item.deviceData || null,
+            timestamp: item.timestamp ? ensureDate(item.timestamp) : item.timestamp,
+            entries: item.entries ? item.entries.map(e => ({
+              ...e,
+              timestamp: e.timestamp ? ensureDate(e.timestamp) : e.timestamp
+            })) : item.entries
+          };
+        }
+        return item;
+      });
+    }
+    if (data && data.uid !== undefined && !Array.isArray(data)) {
+      data = {
+        userid: data.userid || data.userId || data.uid?.toString(),
+        ...data,
+        role: data.role ?? 0,
+        password: data.password ?? '',
+        deviceData: data.deviceData || null,
+        timestamp: data.timestamp ? ensureDate(data.timestamp) : data.timestamp,
+        entries: data.entries ? data.entries.map(e => ({
+          ...e,
+          timestamp: e.timestamp ? ensureDate(e.timestamp) : e.timestamp
+        })) : data.entries
+      };
+    }
+    return originalJson.call(this, data);
+  };
+  next();
+});
+
+function ensureDate(date) {
+  if (!date) return null;
+  if (date instanceof Date) return date;
+  if (typeof date === 'string' || typeof date === 'number') {
+    const d = new Date(date);
+    return isNaN(d.getTime()) ? null : d;
+  }
+  return date;
+}
+
 // Routes
 app.use('/api', attendanceRoutes);
 
@@ -96,13 +168,13 @@ app.get('/health', (req, res) => {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     service: 'ZKTeco Attendance API',
-    version: '2.1.0',
+    version: '3.0.0',
     environment: process.env.NODE_ENV || 'development',
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     device: {
-      ip: process.env.ZKTECO_IP || '41.224.4.231',
-      port: process.env.ZKTECO_PORT || 4370
+      ip: process.env.ZK_IP || '10.10.205.10',
+      port: process.env.ZK_PORT || 4370
     }
   });
 });
@@ -110,10 +182,10 @@ app.get('/health', (req, res) => {
 app.get('/api/info', (req, res) => {
   res.json({
     service: 'ZKTeco Attendance System API',
-    version: '2.1.0',
+    version: '3.0.0',
     device: {
-      ip: process.env.ZKTECO_IP || '41.224.4.231',
-      port: process.env.ZKTECO_PORT || 4370,
+      ip: process.env.ZK_IP || '10.10.205.10',
+      port: process.env.ZK_PORT || 4370,
       note: 'Requires port forwarding: router port 4370 → 10.10.205.10:4370'
     },
     endpoints: {
@@ -124,6 +196,27 @@ app.get('/api/info', (req, res) => {
       refresh: '/api/refresh',
       byDate: '/api/by-date/:date',
       byEmployee: '/api/by-employee/:uid',
+    }
+  });
+});
+
+app.get('/api/debug/schema', (req, res) => {
+  if (!zktecoService) return res.json({ error: 'Service not initialized' });
+  const sample = zktecoService.getProcessedData()[0];
+  const userSample = zktecoService.getUsers()[0];
+  res.json({
+    processedData: {
+      hasUserid: 'userid' in (sample || {}),
+      hasUserId: 'userId' in (sample || {}),
+      timestampType: sample?.timestamp ? typeof sample.timestamp : 'missing',
+      fields: Object.keys(sample || {}),
+      sample: sample
+    },
+    users: {
+      hasUserid: 'userid' in (userSample || {}),
+      hasUserId: 'userId' in (userSample || {}),
+      fields: Object.keys(userSample || {}),
+      sample: userSample
     }
   });
 });
@@ -151,60 +244,58 @@ app.use((err, req, res, next) => {
 });
 
 // ── ZKTeco Service initialization ─────────────────────────────
-// Uses public IP — requires port forwarding on office router:
-//   port 4370 → 10.10.205.10:4370
-// ──────────────────────────────────────────────────────────────
 let zktecoService;
 try {
   const ZktecoService = require('./zkteco-service');
-  const zktecoIp   = process.env.ZKTECO_IP   || '41.224.4.231';
-  const zktecoPort = parseInt(process.env.ZKTECO_PORT) || 4370;
+  const zktecoIp   = process.env.ZK_IP   || '10.10.205.10';
+  const zktecoPort = parseInt(process.env.ZK_PORT) || 4370;
 
   zktecoService = new ZktecoService(zktecoIp, zktecoPort, 5200, 5000);
-
-  // ✅ Share the single instance with routes (no duplicate connections)
   setZktecoService(zktecoService);
 
-  // Auto-fetch every 5 minutes
+  // Auto-sync from device every 5 minutes
   cron.schedule('*/5 * * * *', async () => {
-    console.log('\n=== Auto-fetch from ZKTeco device ===');
+    console.log('\n=== Auto-sync from ZKTeco device ===');
     try {
       await zktecoService.fetchAllData();
-      console.log('=== Auto-fetch completed successfully ===\n');
+      console.log('=== Auto-sync completed successfully ===\n');
     } catch (error) {
-      console.error('=== Auto-fetch failed:', error.message, '===\n');
+      console.error('=== Auto-sync failed:', error.message, '===\n');
     }
   });
 
-  // Initial connection
+  // Startup sequence
   (async () => {
     console.log('=== Initializing ZKTeco service ===');
     console.log(`=== Device: ${zktecoIp}:${zktecoPort} ===`);
+
+    // Step 1: Load cached data from DB so API is immediately available
     try {
-      await zktecoService.initialize();
-      console.log('=== ZKTeco service initialized ===');
-
-      setTimeout(async () => {
-        try {
-          console.log('=== Fetching initial data... ===');
-          const result = await zktecoService.fetchAllData();
-          console.log('=== Initial data fetched ===');
-          console.log('Users:', result.usersCount);
-          console.log('Logs:', result.logsCount);
-          console.log('Processed:', result.processedCount);
-          console.log('Real data:', result.isRealData ? 'YES ✅' : 'NO ❌');
-        } catch (error) {
-          console.error('=== Initial fetch failed ===');
-          console.error('Message:', error.message);
-          console.error('👉 Check port forwarding: router port 4370 → 10.10.205.10:4370');
-        }
-      }, 3000);
-
-    } catch (error) {
-      console.error('=== ZKTeco initialization failed ===');
-      console.error('Message:', error.message);
-      console.error('👉 Check port forwarding: router port 4370 → 10.10.205.10:4370');
+      console.log('=== Loading cached data from DB... ===');
+      await zktecoService.loadUsersFromDB();
+      await zktecoService.loadProcessedDataFromDB();
+      console.log(`=== Cache loaded: ${zktecoService.users.length} users, ${zktecoService.processedData.length} records ===`);
+    } catch (err) {
+      console.warn('⚠️  Could not load DB cache:', err.message);
     }
+
+    // Step 2: Sync fresh data from device in background
+    setTimeout(async () => {
+      try {
+        console.log('=== Fetching fresh data from device... ===');
+        const result = await zktecoService.fetchAllData();
+        console.log('=== Initial sync completed ===');
+        console.log('Users:', result.usersCount);
+        console.log('Logs:', result.logsCount);
+        console.log('Processed:', result.processedCount);
+        console.log('Real data:', result.isRealData ? 'YES ✅' : 'NO ❌');
+      } catch (error) {
+        console.error('=== Initial device sync failed (serving DB cache) ===');
+        console.error('Message:', error.message);
+        console.error('👉 Check port forwarding: router port 4370 → 10.10.205.10:4370');
+      }
+    }, 3000);
+
   })();
 
 } catch (error) {
@@ -226,13 +317,13 @@ const server = app.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════════╗
 ║        BACKEND API ZKTECO ATTENDANCE SYSTEM          ║
-║                    v2.1.0                            ║
+║                    v3.0.0                            ║
 ╚══════════════════════════════════════════════════════╝
 
-  📍 Server: http://localhost:${PORT}
+  📍 Server:      http://localhost:${PORT}
   🔧 Environment: ${process.env.NODE_ENV || 'development'}
-  🕐 Started: ${new Date().toISOString()}
-  📡 ZKTeco device: ${process.env.ZKTECO_IP || '41.224.4.231'}:${process.env.ZKTECO_PORT || 4370}
+  🕐 Started:     ${new Date().toISOString()}
+  📡 ZKTeco:      ${process.env.ZK_IP || '10.10.205.10'}:${process.env.ZK_PORT || 4370}
 
   ⚠️  REQUIRES: Port forwarding on office router
       Router port 4370 → 10.10.205.10:4370
@@ -245,6 +336,7 @@ const server = app.listen(PORT, () => {
   🔄 Refresh:      http://localhost:${PORT}/api/refresh
   📅 By Date:      http://localhost:${PORT}/api/by-date/:date
   👤 By Employee:  http://localhost:${PORT}/api/by-employee/:uid
+  🔍 Debug Schema: http://localhost:${PORT}/api/debug/schema
   `);
 });
 
