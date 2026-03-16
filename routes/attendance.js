@@ -9,7 +9,6 @@ const router = express.Router();
 
 let zktecoService = null;
 
-// Called once from server.js to inject the shared instance
 const setZktecoService = (service) => {
     zktecoService = service;
     console.log('✅ ZktecoService injected into routes');
@@ -46,6 +45,11 @@ const initializeService = async () => {
     return initializationPromise;
 };
 
+// ── FIXED ensureInitialized ────────────────────────────────────
+// If DB cache is already loaded in memory (from startup), serve
+// immediately without requiring device connection.
+// Only return 503 if there is truly no data at all.
+// ──────────────────────────────────────────────────────────────
 const ensureInitialized = async (req, res, next) => {
     if (!zktecoService) {
         return res.status(503).json({
@@ -54,6 +58,16 @@ const ensureInitialized = async (req, res, next) => {
             message: 'ZKTeco service not initialized yet'
         });
     }
+
+    // ✅ If DB cache is already loaded, serve immediately
+    const hasData = (zktecoService.users && zktecoService.users.length > 0) ||
+                    (zktecoService.processedData && zktecoService.processedData.length > 0);
+
+    if (hasData) {
+        return next();
+    }
+
+    // No data yet — try to connect to device
     try {
         await initializeService();
         next();
@@ -76,7 +90,7 @@ router.get('/test', (req, res) => {
         serviceInitialized: initializationPromise !== null,
         deviceConnected: zktecoService?.isConnected || false,
         deviceIp: zktecoService?.ip || 'not set',
-        version: '2.1.0'
+        version: '3.0.0'
     });
 });
 
@@ -452,7 +466,16 @@ router.get('/debug/mapping', ensureInitialized, async (req, res) => {
             if (!matchedUser && log.userid) matchedUser = users.find(u => u.userid === log.userid);
             if (!matchedUser && log.pointeuseUserId) matchedUser = users.find(u => u.pointeuseUserId === log.pointeuseUserId);
             return {
-                log: { uid: log.uid, userid: log.userid, pointeuseUserId: log.pointeuseUserId, timestamp: log.timestamp ? log.timestamp.toISOString() : 'null', type: log.type },
+                log: {
+                    uid: log.uid,
+                    userid: log.userid,
+                    pointeuseUserId: log.pointeuseUserId,
+                    // ✅ Safe timestamp — check type before calling toISOString
+                    timestamp: log.timestamp instanceof Date
+                        ? log.timestamp.toISOString()
+                        : (log.timestamp ? String(log.timestamp) : 'null'),
+                    type: log.type
+                },
                 matchedUser: matchedUser ? { uid: matchedUser.uid, userid: matchedUser.userid, pointeuseUserId: matchedUser.pointeuseUserId, name: matchedUser.name } : null
             };
         });
@@ -462,7 +485,11 @@ router.get('/debug/mapping', ensureInitialized, async (req, res) => {
         const userUIDs = [...new Set(users.map(u => u.uid))].slice(0, 20);
         res.json({
             success: true,
-            stats: { users: users.length, logs: logs.length, processed: processed.length, sampleSize: sampleLogs.length, matched: matchedCount, unmatched: unmatchedCount, matchRate: ((matchedCount / sampleLogs.length) * 100).toFixed(2) + '%' },
+            stats: {
+                users: users.length, logs: logs.length, processed: processed.length,
+                sampleSize: sampleLogs.length, matched: matchedCount, unmatched: unmatchedCount,
+                matchRate: sampleLogs.length > 0 ? ((matchedCount / sampleLogs.length) * 100).toFixed(2) + '%' : '0%'
+            },
             logUIDs, userUIDs, sampleLogs,
             usersSample: users.slice(0, 5),
             logsSample: logs.slice(0, 5),
@@ -504,7 +531,7 @@ router.get('/test-connection', async (req, res) => {
 router.get('/real-employees', async (req, res) => {
     try {
         if (!zktecoService) return res.status(503).json({ success: false, error: 'Service not available' });
-        if (zktecoService.realEmployees) {
+        if (zktecoService.realEmployees && zktecoService.realEmployees.length > 0) {
             res.json({ success: true, count: zktecoService.realEmployees.length, employees: zktecoService.realEmployees });
         } else {
             const users = zktecoService.getUsers();
@@ -544,7 +571,11 @@ router.get('/debug/test-correspondance', ensureInitialized, async (req, res) => 
         const failCount = testResults.filter(r => r.matchType === 'FAILED').length;
         res.json({
             success: true,
-            stats: { totalLogs: logs.length, sampleSize: logSample.length, successCount, failCount, successRate: `${((successCount / logSample.length) * 100).toFixed(1)}%` },
+            stats: {
+                totalLogs: logs.length, sampleSize: logSample.length,
+                successCount, failCount,
+                successRate: logSample.length > 0 ? `${((successCount / logSample.length) * 100).toFixed(1)}%` : '0%'
+            },
             testResults,
             allPointeuseUserIds: [...new Set(logs.map(l => l.pointeuseUserId).filter(id => id && id !== '0'))].sort(),
             realEmployees: zktecoService.realEmployees ? zktecoService.realEmployees.map(emp => ({ name: emp.name, matricule: emp.matricule, pointeuseUserId: emp.pointeuseUserId })) : []
@@ -650,7 +681,13 @@ router.post('/reset', async (req, res) => {
         zktecoService.processedData = [];
         zktecoService.device = null;
         zktecoService.isConnected = false;
-        await initializeService();
+        // ✅ Reload DB cache immediately so API doesn't serve empty data after reset
+        await zktecoService.loadUsersFromDB();
+        await zktecoService.loadProcessedDataFromDB();
+        // Try device reconnection in background (non-blocking)
+        initializeService().catch(err => {
+            console.warn('⚠️ Device reconnection after reset failed:', err.message);
+        });
         res.json({ success: true, message: 'Service réinitialisé avec succès', timestamp: new Date().toISOString() });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
