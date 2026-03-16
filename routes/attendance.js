@@ -16,6 +16,25 @@ const setZktecoService = (service) => {
 
 let initializationPromise = null;
 
+// Helper to ensure CORS headers for all responses
+const setCORSHeaders = (req, res) => {
+    const origin = req.headers.origin;
+    if (origin && (
+        origin.includes('localhost') || 
+        origin === 'https://pointeuse-sts.azurewebsites.net' ||
+        origin === 'https://avo-hr-managment.azurewebsites.net'
+    )) {
+        res.header('Access-Control-Allow-Origin', origin);
+        res.header('Access-Control-Allow-Credentials', 'true');
+    }
+};
+
+// Apply CORS headers to all routes
+router.use((req, res, next) => {
+    setCORSHeaders(req, res);
+    next();
+});
+
 const initializeService = async () => {
     if (!initializationPromise) {
         initializationPromise = (async () => {
@@ -51,6 +70,9 @@ const initializeService = async () => {
 // Only return 503 if there is truly no data at all.
 // ──────────────────────────────────────────────────────────────
 const ensureInitialized = async (req, res, next) => {
+    // Always set CORS headers
+    setCORSHeaders(req, res);
+    
     if (!zktecoService) {
         return res.status(503).json({
             success: false,
@@ -83,6 +105,7 @@ const ensureInitialized = async (req, res, next) => {
 
 // Routes de base
 router.get('/test', (req, res) => {
+    setCORSHeaders(req, res);
     res.json({
         success: true,
         message: 'API fonctionnelle',
@@ -95,6 +118,7 @@ router.get('/test', (req, res) => {
 });
 
 router.get('/cors-test', (req, res) => {
+    setCORSHeaders(req, res);
     res.json({
         success: true,
         message: 'CORS test réussi',
@@ -111,6 +135,7 @@ router.get('/cors-test', (req, res) => {
 });
 
 router.get('/health', async (req, res) => {
+    setCORSHeaders(req, res);
     try {
         const isInitialized = initializationPromise !== null;
         const summary = zktecoService?.getSummary ? zktecoService.getSummary() : {};
@@ -156,7 +181,7 @@ router.get('/users', ensureInitialized, async (req, res) => {
             }
         });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message, stack: process.env.NODE_ENV === 'development' ? error.stack : undefined });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -174,7 +199,7 @@ router.get('/logs', ensureInitialized, async (req, res) => {
             metadata: { realData: zktecoService.isConnected, deviceIp: zktecoService.ip, lastUpdate: new Date().toISOString() }
         });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message, stack: process.env.NODE_ENV === 'development' ? error.stack : undefined });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -197,7 +222,7 @@ router.get('/attendance', ensureInitialized, async (req, res) => {
             }
         });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message, stack: process.env.NODE_ENV === 'development' ? error.stack : undefined });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -219,8 +244,7 @@ router.post('/refresh', ensureInitialized, async (req, res) => {
         res.status(500).json({
             success: false,
             error: error.message,
-            hint: 'Check port forwarding on office router: port 4370 → 10.10.205.10',
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+            hint: 'Check port forwarding on office router: port 4370 → 10.10.205.10'
         });
     }
 });
@@ -470,7 +494,6 @@ router.get('/debug/mapping', ensureInitialized, async (req, res) => {
                     uid: log.uid,
                     userid: log.userid,
                     pointeuseUserId: log.pointeuseUserId,
-                    // ✅ Safe timestamp — check type before calling toISOString
                     timestamp: log.timestamp instanceof Date
                         ? log.timestamp.toISOString()
                         : (log.timestamp ? String(log.timestamp) : 'null'),
@@ -497,7 +520,7 @@ router.get('/debug/mapping', ensureInitialized, async (req, res) => {
             realEmployees: zktecoService.realEmployees ? zktecoService.realEmployees.slice(0, 5) : []
         });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message, stack: process.env.NODE_ENV === 'development' ? error.stack : undefined });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -616,7 +639,7 @@ router.get('/debug/raw-attendances', ensureInitialized, async (req, res) => {
             totalLogs: Array.isArray(rawData) ? rawData.length : 0
         });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message, stack: process.env.NODE_ENV === 'development' ? error.stack : undefined });
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
