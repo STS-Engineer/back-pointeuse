@@ -16,22 +16,20 @@ const setZktecoService = (service) => {
 
 let initializationPromise = null;
 
-// Helper to ensure CORS headers for all responses
+// ── CORS: Allow ANY origin ─────────────────────────────────────
 const setCORSHeaders = (req, res) => {
-    const origin = req.headers.origin;
-    if (origin && (
-        origin.includes('localhost') || 
-        origin === 'https://pointeuse-sts.azurewebsites.net' ||
-        origin === 'https://avo-hr-managment.azurewebsites.net'
-    )) {
-        res.header('Access-Control-Allow-Origin', origin);
-        res.header('Access-Control-Allow-Credentials', 'true');
-    }
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, Pragma');
+    res.header('Access-Control-Allow-Credentials', 'false');
 };
 
-// Apply CORS headers to all routes
+// Apply CORS headers to ALL routes
 router.use((req, res, next) => {
     setCORSHeaders(req, res);
+    if (req.method === 'OPTIONS') {
+        return res.status(204).end();
+    }
     next();
 });
 
@@ -64,15 +62,15 @@ const initializeService = async () => {
     return initializationPromise;
 };
 
-// ── FIXED ensureInitialized ────────────────────────────────────
+// ── ensureInitialized ──────────────────────────────────────────
 // If DB cache is already loaded in memory (from startup), serve
 // immediately without requiring device connection.
 // Only return 503 if there is truly no data at all.
 // ──────────────────────────────────────────────────────────────
 const ensureInitialized = async (req, res, next) => {
-    // Always set CORS headers
+    // Always set CORS headers first — even on error responses
     setCORSHeaders(req, res);
-    
+
     if (!zktecoService) {
         return res.status(503).json({
             success: false,
@@ -129,7 +127,7 @@ router.get('/cors-test', (req, res) => {
             enabled: true,
             allowedMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
             allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
-            credentials: true
+            credentials: false
         }
     });
 });
@@ -543,6 +541,7 @@ router.get('/debug/logs-raw', ensureInitialized, async (req, res) => {
 });
 
 router.get('/test-connection', async (req, res) => {
+    setCORSHeaders(req, res);
     try {
         const result = await zktecoService.testConnection();
         res.json(result);
@@ -552,6 +551,7 @@ router.get('/test-connection', async (req, res) => {
 });
 
 router.get('/real-employees', async (req, res) => {
+    setCORSHeaders(req, res);
     try {
         if (!zktecoService) return res.status(503).json({ success: false, error: 'Service not available' });
         if (zktecoService.realEmployees && zktecoService.realEmployees.length > 0) {
@@ -694,6 +694,7 @@ router.get('/debug/force-match/:matricule', ensureInitialized, async (req, res) 
 });
 
 router.post('/reset', async (req, res) => {
+    setCORSHeaders(req, res);
     try {
         if (!zktecoService) return res.status(503).json({ success: false, error: 'Service not available' });
         console.log('🔄 Réinitialisation du service demandée...');
@@ -704,10 +705,8 @@ router.post('/reset', async (req, res) => {
         zktecoService.processedData = [];
         zktecoService.device = null;
         zktecoService.isConnected = false;
-        // ✅ Reload DB cache immediately so API doesn't serve empty data after reset
         await zktecoService.loadUsersFromDB();
         await zktecoService.loadProcessedDataFromDB();
-        // Try device reconnection in background (non-blocking)
         initializeService().catch(err => {
             console.warn('⚠️ Device reconnection after reset failed:', err.message);
         });
