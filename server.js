@@ -11,19 +11,16 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ── Database Pools ─────────────────────────────────────────────
-// Attendance DB — stores raw logs, daily records, employees mirror
 const pool = new Pool({
-  connectionString: 'postgresql://administrationSTS:St$@0987@avo-adb-002.postgres.database.azure.com:5432/attendance?sslmode=require',
+  connectionString: process.env.ATTENDANCE_DB_URL || 'postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/attendance?sslmode=require',
   ssl: { rejectUnauthorized: false },
 });
 
-// HR DB — source of truth for active employees (statut = 'actif')
 const hrPool = new Pool({
-  connectionString: 'postgresql://administrationSTS:St$@0987@avo-adb-002.postgres.database.azure.com:5432/rh_application?sslmode=require',
+  connectionString: process.env.HR_DB_URL || 'postgresql://administrationSTS:St%24%400987@avo-adb-002.postgres.database.azure.com:5432/rh_application?sslmode=require',
   ssl: { rejectUnauthorized: false },
 });
 
-// Make pools available to zkteco-service via global so no db.js needed
 global.attendancePool = pool;
 global.hrPool = hrPool;
 
@@ -32,125 +29,46 @@ const attendanceRoutes = require('./routes/attendance');
 const { setZktecoService } = require('./routes/attendance');
 
 // ============================================================
-// CRITICAL FIX: CORS MUST BE ABSOLUTE FIRST
+// CORS — Allow ALL origins on EVERY response including errors
 // ============================================================
-
-// 1. RAW CORS HANDLER - MUST BE VERY FIRST MIDDLEWARE
 app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  
-  // Define allowed origins
-  const allowedOrigins = [
-    'http://localhost:8080',
-    'http://localhost:3000',
-    'http://localhost:5500',
-    'http://localhost:5173',
-    'http://localhost:4200',
-    'http://localhost:3001',
-    'http://localhost:8081',
-    'http://127.0.0.1:8080',
-    'http://127.0.0.1:3000',
-    'https://pointeuse-sts.azurewebsites.net',
-    'https://avo-hr-managment.azurewebsites.net',
-    'https://pointeuse-back.azurewebsites.net'
-  ];
-  
-  // Check if origin is allowed
-  if (origin && allowedOrigins.includes(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-  } else if (!origin) {
-    // Allow requests with no origin (like mobile apps, curl)
-    res.header('Access-Control-Allow-Origin', '*');
-  } else {
-    // Default to frontend URL
-    res.header('Access-Control-Allow-Origin', 'https://pointeuse-sts.azurewebsites.net');
-  }
-  
-  // Set all CORS headers
+  res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Access-Token, X-Key, X-Forwarded-For, X-Forwarded-Proto, Cache-Control, Pragma, If-Modified-Since');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Expose-Headers', 'Content-Range, X-Content-Range, X-Total-Count, Link, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, Pragma');
+  res.header('Access-Control-Allow-Credentials', 'false');
   res.header('Access-Control-Max-Age', '86400');
-  
-  // Handle preflight requests immediately
+
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
   }
-  
   next();
 });
 
-// 2. CORS package configuration (backup)
-const corsOptions = {
-  origin: function (origin, callback) {
-    const allowedOrigins = [
-      'http://localhost:8080',
-      'http://localhost:3000',
-      'http://localhost:5500',
-      'http://localhost:5173',
-      'http://localhost:4200',
-      'http://localhost:3001',
-      'http://localhost:8081',
-      'http://127.0.0.1:8080',
-      'http://127.0.0.1:3000',
-      'https://pointeuse-sts.azurewebsites.net',
-      'https://avo-hr-managment.azurewebsites.net',
-      'https://pointeuse-back.azurewebsites.net'
-    ];
-    
-    // Allow requests with no origin
-    if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.indexOf(origin) !== -1 || process.env.NODE_ENV === 'development') {
-      callback(null, true);
-    } else {
-      console.log('❌ CORS blocked origin:', origin);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+// cors package (backup)
+app.use(cors({
+  origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH', 'HEAD'],
-  allowedHeaders: [
-    'Origin', 'X-Requested-With', 'Content-Type', 'Accept',
-    'Authorization', 'X-Access-Token', 'X-Key', 'X-Forwarded-For',
-    'X-Forwarded-Proto', 'Cache-Control', 'Pragma', 'If-Modified-Since'
-  ],
-  exposedHeaders: [
-    'Content-Range', 'X-Content-Range', 'X-Total-Count',
-    'Link', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'
-  ],
-  credentials: true,
-  preflightContinue: false,
+  allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization', 'Cache-Control', 'Pragma'],
+  credentials: false,
   optionsSuccessStatus: 204,
-  maxAge: 86400
-};
+}));
 
-app.use(cors(corsOptions));
-
-// 3. Security middlewares (configured to allow CORS)
+// Security middlewares
 app.use(helmet({
   crossOriginEmbedderPolicy: false,
-  crossOriginResourcePolicy: { policy: "cross-origin" },
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com"],
+      styleSrc: ["'self'", "'unsafe-inline'", 'https://cdnjs.cloudflare.com'],
       scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
-      fontSrc: ["'self'", "https://cdnjs.cloudflare.com", "https://fonts.gstatic.com"],
-      imgSrc: ["'self'", "data:", "https:"],
-      connectSrc: [
-        "'self'", 
-        "http://localhost:3000", 
-        "ws://localhost:*",
-        "https://pointeuse-sts.azurewebsites.net",
-        "https://pointeuse-back.azurewebsites.net",
-        "https://avo-hr-managment.azurewebsites.net"
-      ]
+      fontSrc: ["'self'", 'https://cdnjs.cloudflare.com', 'https://fonts.gstatic.com'],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      connectSrc: ["'self'", '*']
     }
   }
 }));
 
-// 4. Other middleware
 app.use(compression());
 app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
@@ -161,9 +79,11 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // ============================================================
 app.use((req, res, next) => {
   const originalJson = res.json;
-  
-  res.json = function(data) {
-    // Transform arrays
+
+  res.json = function (data) {
+    // Always re-stamp CORS on every JSON response
+    res.header('Access-Control-Allow-Origin', '*');
+
     if (Array.isArray(data)) {
       data = data.map(item => {
         if (item && item.uid !== undefined) {
@@ -183,8 +103,7 @@ app.use((req, res, next) => {
         return item;
       });
     }
-    
-    // Transform single objects
+
     if (data && data.uid !== undefined && !Array.isArray(data)) {
       data = {
         userid: data.userid || data.userId || data.uid?.toString(),
@@ -199,10 +118,10 @@ app.use((req, res, next) => {
         })) : data.entries
       };
     }
-    
+
     return originalJson.call(this, data);
   };
-  
+
   next();
 });
 
@@ -259,10 +178,8 @@ app.get('/api/info', (req, res) => {
 
 app.get('/api/debug/schema', (req, res) => {
   if (!zktecoService) return res.json({ error: 'Service not initialized' });
-  
   const sample = zktecoService.getProcessedData()[0];
   const userSample = zktecoService.getUsers()[0];
-  
   res.json({
     processedData: {
       hasUserid: 'userid' in (sample || {}),
@@ -289,21 +206,15 @@ app.use('*', (req, res) => {
   });
 });
 
-// Global error handler
+// Global error handler — CORS headers guaranteed
 app.use((err, req, res, next) => {
   console.error('Global error handler:', err);
-  
-  // Ensure CORS headers are set even for errors
-  const origin = req.headers.origin;
-  if (origin) {
-    res.header('Access-Control-Allow-Origin', origin);
-    res.header('Access-Control-Allow-Credentials', 'true');
-  }
-  
+  res.header('Access-Control-Allow-Origin', '*');
+
   if (err.name === 'CorsError') {
     return res.status(403).json({ error: 'CORS Error', message: 'Origin not allowed' });
   }
-  
+
   res.status(err.status || 500).json({
     error: err.name || 'Internal Server Error',
     message: err.message || 'Something went wrong',
@@ -315,7 +226,7 @@ app.use((err, req, res, next) => {
 let zktecoService;
 try {
   const ZktecoService = require('./zkteco-service');
-  const zktecoIp   = process.env.ZK_IP   || '10.10.205.10';
+  const zktecoIp = process.env.ZK_IP || '10.10.205.10';
   const zktecoPort = parseInt(process.env.ZK_PORT) || 4370;
 
   zktecoService = new ZktecoService(zktecoIp, zktecoPort, 5200, 5000);
@@ -337,7 +248,7 @@ try {
     console.log('=== Initializing ZKTeco service ===');
     console.log(`=== Device: ${zktecoIp}:${zktecoPort} ===`);
 
-    // Step 1: Load cached data from DB so API is immediately available
+    // Step 1: Load cached data from DB immediately
     try {
       console.log('=== Loading cached data from DB... ===');
       await zktecoService.loadUsersFromDB();
@@ -347,7 +258,7 @@ try {
       console.warn('⚠️ Could not load DB cache:', err.message);
     }
 
-    // Step 2: Sync fresh data from device in background
+    // Step 2: Sync from device in background
     setTimeout(async () => {
       try {
         console.log('=== Fetching fresh data from device... ===');
@@ -424,6 +335,6 @@ const shutdown = (signal) => {
 };
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 module.exports = { app, server, zktecoService };
