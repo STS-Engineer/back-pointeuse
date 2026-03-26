@@ -2,12 +2,11 @@ const Zkteco = require('zkteco-js');
 const moment = require('moment-timezone');
 
 function toDateKey(d) {
-    return new Date(d).toISOString().split('T')[0];
+    return moment(d).tz('Africa/Tunis').format('YYYY-MM-DD');
 }
 
 function toTimeHHMM(d) {
-    const dt = new Date(d);
-    return `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}`;
+    return moment(d).tz('Africa/Tunis').format('HH:mm');
 }
 
 class ZktecoService {
@@ -24,7 +23,6 @@ class ZktecoService {
         console.log(`🚀 ZktecoService initialized — device: ${this.ip}:${this.port}`);
     }
 
-    // ── Connect to device ─────────────────────────────────────
     async connect() {
         try {
             console.log(`🔌 Connecting to ZKTeco at ${this.ip}:${this.port}...`);
@@ -40,7 +38,6 @@ class ZktecoService {
         }
     }
 
-    // ── Disconnect from device ────────────────────────────────
     async disconnect() {
         if (this.device) {
             try {
@@ -54,7 +51,6 @@ class ZktecoService {
         console.log('🔌 Disconnected from ZKTeco device');
     }
 
-    // ── Load active employees from HR DB ─────────────────────
     async loadEmployeesFromHRDB() {
         console.log('👥 Loading active employees from HR DB...');
         const { rows } = await global.hrPool.query(`
@@ -75,7 +71,6 @@ class ZktecoService {
         return employees;
     }
 
-    // ── Sync employees to Attendance DB ──────────────────────
     async syncEmployeesToAttendanceDB(employees) {
         const client = await global.attendancePool.connect();
         try {
@@ -108,7 +103,6 @@ class ZktecoService {
         }
     }
 
-    // ── Parse raw logs from device ────────────────────────────
     parseRawLogs(rawLogs) {
         return rawLogs.map(log => {
             let logTime;
@@ -139,7 +133,6 @@ class ZktecoService {
                 logTime = new Date();
             }
 
-            // Extract user ID from log
             const possibleFields = ['enrollNumber', 'PIN', 'user_id', 'userId', 'userid', 'uid'];
             let userId = '0';
             for (const field of possibleFields) {
@@ -164,7 +157,6 @@ class ZktecoService {
         }).filter(log => log.timestamp && !isNaN(log.timestamp.getTime()));
     }
 
-    // ── Save raw logs to DB ───────────────────────────────────
     async insertRawLogs(parsedLogs) {
         const client = await global.attendancePool.connect();
         let inserted = 0;
@@ -199,43 +191,38 @@ class ZktecoService {
         }
     }
 
-    // ── Recompute daily records from raw logs ─────────────────
     async recomputeDailyFromRaw(daysBack = 30) {
         const client = await global.attendancePool.connect();
         try {
-            const since = new Date();
-            since.setDate(since.getDate() - daysBack);
+            const since = moment().tz('Africa/Tunis').subtract(daysBack, 'days').toDate();
 
-            // Get raw logs
             const { rows: rawRows } = await client.query(`
-                SELECT uid, ts, verify_type
+                SELECT uid, ts, state, verify_type
                 FROM public.attendance_logs_raw
                 WHERE ts >= $1
                 ORDER BY ts ASC
             `, [since]);
 
-            // Get employees
             const { rows: empRows } = await client.query(`
                 SELECT uid, matricule, pointeuse_user_id, full_name, card_no
                 FROM public.employees
             `);
 
-            // Build lookup maps
             const byPointeuse = new Map();
             const byMatricule = new Map();
             const byUid = new Map();
+
             for (const e of empRows) {
                 byPointeuse.set(String(e.pointeuse_user_id), e);
                 byMatricule.set(String(e.matricule), e);
                 byUid.set(String(e.uid), e);
             }
 
-            // Group logs by employee + date
             const groups = new Map();
+
             for (const r of rawRows) {
                 const logUserId = String(r.uid);
 
-                // Find employee
                 const emp = byPointeuse.get(logUserId) ||
                     byMatricule.get(logUserId) ||
                     byUid.get(logUserId) ||
@@ -249,8 +236,10 @@ class ZktecoService {
 
                 if (!emp) continue;
 
-                const dateKey = toDateKey(r.ts);
-                const dayOfWeek = new Date(dateKey).getDay();
+                const m = moment(r.ts).tz('Africa/Tunis');
+                const dateKey = m.format('YYYY-MM-DD');
+                const dayOfWeek = m.day();
+
                 if (dayOfWeek === 0 || dayOfWeek === 6) continue; // skip weekends
 
                 const key = `${emp.uid}-${dateKey}`;
@@ -266,23 +255,27 @@ class ZktecoService {
                     });
                 }
 
-                const dt = new Date(r.ts);
                 groups.get(key).entries.push({
-                    timestamp: dt,
-                    time: toTimeHHMM(dt),
-                    hour: dt.getHours(),
-                    minute: dt.getMinutes(),
+                    timestamp: m.toISOString(),
+                    time: m.format('HH:mm'),
+                    hour: Number(m.format('H')),
+                    minute: Number(m.format('m')),
+                    state: r.state ?? null,
+                    originalType: r.verify_type,
                     type: r.verify_type,
                 });
             }
 
-            // Compute daily records
             const dayNames = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
-            const today = new Date().toISOString().split('T')[0];
+            const today = moment().tz('Africa/Tunis').format('YYYY-MM-DD');
             const dailyRecords = [];
 
             for (const g of groups.values()) {
-                g.entries.sort((a, b) => a.hour !== b.hour ? a.hour - b.hour : a.minute - b.minute);
+                g.entries.sort((a, b) => {
+                    const aMinutes = a.hour * 60 + a.minute;
+                    const bMinutes = b.hour * 60 + b.minute;
+                    return aMinutes - bMinutes;
+                });
 
                 const record = {
                     uid: g.uid,
@@ -291,7 +284,7 @@ class ZktecoService {
                     name: g.name,
                     cardNo: g.cardNo,
                     workDate: g.date,
-                    dayName: dayNames[new Date(g.date).getDay()],
+                    dayName: dayNames[moment.tz(g.date, 'YYYY-MM-DD', 'Africa/Tunis').day()],
                     arrivalTime: null,
                     departureTime: null,
                     hoursWorked: '0.00',
@@ -301,49 +294,63 @@ class ZktecoService {
                 };
 
                 if (g.entries.length > 0) {
-                    // First entry = arrival
-                    const first = g.entries[0];
-                    record.arrivalTime = first.time;
-                    first.type = 0;
-                    first.typeLabel = 'Arrivée';
+                    const arrivals = g.entries.filter(e => e.state === 0);
+                    const departures = g.entries.filter(e => e.state === 1);
 
-                    const arrivalMinutes = first.hour * 60 + first.minute;
-                    if (arrivalMinutes < 8 * 60) record.status = "À l'heure";
-                    else if (arrivalMinutes <= 9 * 60) record.status = 'Présent';
-                    else record.status = 'En retard';
+                    const firstArrival = arrivals.length > 0 ? arrivals[0] : g.entries[0];
+                    const lastDeparture = departures.length > 0 ? departures[departures.length - 1] : null;
 
-                    if (g.entries.length > 1) {
-                        // Last entry = departure
-                        const last = g.entries[g.entries.length - 1];
-                        record.departureTime = last.time;
-                        last.type = 1;
-                        last.typeLabel = 'Départ';
+                    if (firstArrival) {
+                        record.arrivalTime = firstArrival.time;
+                        firstArrival.type = 0;
+                        firstArrival.typeLabel = 'Arrivée';
 
-                        // Middle entries = passages
-                        for (let i = 1; i < g.entries.length - 1; i++) {
-                            g.entries[i].type = 2;
-                            g.entries[i].typeLabel = 'Passage';
+                        const arrivalMinutes = firstArrival.hour * 60 + firstArrival.minute;
+                        if (arrivalMinutes < 8 * 60) record.status = "À l'heure";
+                        else if (arrivalMinutes <= 9 * 60) record.status = 'Présent';
+                        else record.status = 'En retard';
+                    }
+
+                    if (lastDeparture && (!firstArrival || lastDeparture.time !== firstArrival.time)) {
+                        record.departureTime = lastDeparture.time;
+                        lastDeparture.type = 1;
+                        lastDeparture.typeLabel = 'Départ';
+                    }
+
+                    for (const entry of g.entries) {
+                        const isArrival = firstArrival && entry.timestamp === firstArrival.timestamp && entry.time === firstArrival.time;
+                        const isDeparture = lastDeparture && entry.timestamp === lastDeparture.timestamp && entry.time === lastDeparture.time;
+
+                        if (!isArrival && !isDeparture) {
+                            entry.type = 2;
+                            entry.typeLabel = 'Passage';
                         }
+                    }
 
-                        // Calculate hours worked
+                    if (record.arrivalTime && record.departureTime) {
                         const [ah, am] = record.arrivalTime.split(':').map(Number);
                         const [dh, dm] = record.departureTime.split(':').map(Number);
+
                         let totalMinutes = (dh * 60 + dm) - (ah * 60 + am);
-                        if (totalMinutes > 240) totalMinutes -= 60; // subtract lunch break
+
+                        if (totalMinutes < 0) {
+                            totalMinutes += 24 * 60;
+                        }
+
+                        if (totalMinutes > 240) {
+                            totalMinutes -= 60; // lunch break
+                        }
+
                         totalMinutes = Math.max(0, totalMinutes);
                         record.hoursWorked = (totalMinutes / 60).toFixed(2);
-                    } else {
-                        // Only one entry — still here today
-                        if (record.workDate === today) {
-                            record.status = 'En cours';
-                        }
+                    } else if (record.arrivalTime && record.workDate === today) {
+                        record.status = 'En cours';
                     }
                 }
 
                 dailyRecords.push(record);
             }
 
-            // Upsert daily records
             await client.query('BEGIN');
             for (const r of dailyRecords) {
                 await client.query(`
@@ -382,9 +389,6 @@ class ZktecoService {
         }
     }
 
-    // ── Main sync: device → DB ────────────────────────────────
-    // This is the ONLY function that touches the device
-    // Called by the background job in server.js
     async runSync() {
         if (this.isSyncing) {
             console.log('⏭️ Sync already running, skipping');
@@ -394,7 +398,6 @@ class ZktecoService {
         this.isSyncing = true;
         const startedAt = new Date();
 
-        // Log sync start
         const syncRun = await global.attendancePool.query(`
             INSERT INTO public.sync_runs (started_at, success, message)
             VALUES (NOW(), false, 'running')
@@ -403,14 +406,11 @@ class ZktecoService {
         const syncRunId = syncRun.rows[0].id;
 
         try {
-            // 1. Sync employees from HR DB
             const employees = await this.loadEmployeesFromHRDB();
             await this.syncEmployeesToAttendanceDB(employees);
 
-            // 2. Connect to device
             await this.connect();
 
-            // 3. Fetch raw logs from device
             console.log('📥 Fetching attendance logs from device...');
             const attendanceResponse = await this.device.getAttendances();
             const rawLogs = Array.isArray(attendanceResponse)
@@ -418,14 +418,11 @@ class ZktecoService {
                 : (attendanceResponse.data || attendanceResponse || []);
             console.log(`📝 ${rawLogs.length} raw logs from device`);
 
-            // 4. Parse and save raw logs
             const parsedLogs = this.parseRawLogs(rawLogs);
             const newLogsCount = await this.insertRawLogs(parsedLogs);
 
-            // 5. Recompute daily records (last 30 days)
             const recomputedCount = await this.recomputeDailyFromRaw(30);
 
-            // 6. Update sync run record
             await global.attendancePool.query(`
                 UPDATE public.sync_runs
                 SET finished_at = NOW(),
@@ -459,7 +456,6 @@ class ZktecoService {
             console.error('❌ Sync failed:', error.message);
             this.lastSyncSuccess = false;
 
-            // Update sync run as failed
             await global.attendancePool.query(`
                 UPDATE public.sync_runs
                 SET finished_at = NOW(),
@@ -475,7 +471,6 @@ class ZktecoService {
         }
     }
 
-    // ── Get sync status ───────────────────────────────────────
     getStatus() {
         return {
             isConnected: this.isConnected,
