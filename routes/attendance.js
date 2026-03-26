@@ -1,720 +1,238 @@
 const express = require('express');
 const router = express.Router();
 
-// ── IMPORTANT ─────────────────────────────────────────────────
-// We do NOT create a new ZktecoService instance here.
-// We use the single shared instance passed from server.js.
-// This avoids two simultaneous connections to the ZKTeco device.
-// ──────────────────────────────────────────────────────────────
-
-let zktecoService = null;
-
-const setZktecoService = (service) => {
-    zktecoService = service;
-    console.log('✅ ZktecoService injected into routes');
-};
-
-let initializationPromise = null;
-
-// ── CORS: Allow ANY origin ─────────────────────────────────────
-const setCORSHeaders = (req, res) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization, Cache-Control, Pragma');
-    res.header('Access-Control-Allow-Credentials', 'false');
-};
-
-// Apply CORS headers to ALL routes
+// ── CORS ───────────────────────────────────────────────────────
 router.use((req, res, next) => {
-    setCORSHeaders(req, res);
-    if (req.method === 'OPTIONS') {
-        return res.status(204).end();
-    }
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') return res.status(204).end();
     next();
 });
 
-const initializeService = async () => {
-    if (!initializationPromise) {
-        initializationPromise = (async () => {
-            console.log('=== Initialisation du service dans les routes ===');
-            try {
-                await zktecoService.initialize();
-                console.log('✅ Service initialisé dans les routes');
-                setTimeout(async () => {
-                    try {
-                        const result = await zktecoService.fetchAllData();
-                        console.log('✅ Données initiales chargées');
-                        console.log(`  Utilisateurs: ${result.usersCount}`);
-                        console.log(`  Logs: ${result.logsCount}`);
-                        console.log(`  Données traitées: ${result.processedCount}`);
-                    } catch (error) {
-                        console.error('❌ Erreur lors du chargement initial des données:', error.message);
-                    }
-                }, 2000);
-                return true;
-            } catch (error) {
-                console.error('❌ Erreur d\'initialisation dans les routes:', error.message);
-                initializationPromise = null;
-                throw error;
-            }
-        })();
-    }
-    return initializationPromise;
-};
-
-// ── ensureInitialized ──────────────────────────────────────────
-// If DB cache is already loaded in memory (from startup), serve
-// immediately without requiring device connection.
-// Only return 503 if there is truly no data at all.
-// ──────────────────────────────────────────────────────────────
-const ensureInitialized = async (req, res, next) => {
-    // Always set CORS headers first — even on error responses
-    setCORSHeaders(req, res);
-
-    if (!zktecoService) {
-        return res.status(503).json({
-            success: false,
-            error: 'Service not available',
-            message: 'ZKTeco service not initialized yet'
-        });
-    }
-
-    // ✅ If DB cache is already loaded, serve immediately
-    const hasData = (zktecoService.users && zktecoService.users.length > 0) ||
-                    (zktecoService.processedData && zktecoService.processedData.length > 0);
-
-    if (hasData) {
-        return next();
-    }
-
-    // No data yet — try to connect to device
+// ══════════════════════════════════════════════════════════════
+// GET /api/attendance
+// Returns ALL attendance history from DB
+// Frontend fetches this ONCE and filters locally
+// ══════════════════════════════════════════════════════════════
+router.get('/attendance', async (req, res) => {
     try {
-        await initializeService();
-        next();
-    } catch (error) {
-        res.status(503).json({
-            success: false,
-            error: 'ZKTeco device unreachable',
-            message: `Cannot connect to device at ${zktecoService.ip}:${zktecoService.port}. Check port forwarding on office router (port 4370 → 10.10.205.10).`,
-            device: { ip: zktecoService.ip, port: zktecoService.port }
-        });
-    }
-};
+        const { rows } = await global.attendancePool.query(`
+            SELECT
+                d.uid,
+                d.user_id            AS "userId",
+                d.pointeuse_user_id  AS "pointeuseUserId",
+                d.full_name          AS name,
+                d.card_no            AS "cardNo",
+                d.work_date::text    AS date,
+                d.day_name           AS "dayName",
+                to_char(d.arrival_time,   'HH24:MI') AS "arrivalTime",
+                to_char(d.departure_time, 'HH24:MI') AS "departureTime",
+                d.hours_worked::text AS "hoursWorked",
+                d.status,
+                d.entries,
+                d.last_update        AS "lastUpdate"
+            FROM public.attendance_daily d
+            ORDER BY d.work_date DESC, d.full_name ASC
+        `);
 
-// Routes de base
-router.get('/test', (req, res) => {
-    setCORSHeaders(req, res);
-    res.json({
-        success: true,
-        message: 'API fonctionnelle',
-        timestamp: new Date().toISOString(),
-        serviceInitialized: initializationPromise !== null,
-        deviceConnected: zktecoService?.isConnected || false,
-        deviceIp: zktecoService?.ip || 'not set',
-        version: '3.0.0'
-    });
-});
-
-router.get('/cors-test', (req, res) => {
-    setCORSHeaders(req, res);
-    res.json({
-        success: true,
-        message: 'CORS test réussi',
-        timestamp: new Date().toISOString(),
-        origin: req.headers.origin,
-        headers: req.headers,
-        cors: {
-            enabled: true,
-            allowedMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-            allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
-            credentials: false
-        }
-    });
-});
-
-router.get('/health', async (req, res) => {
-    setCORSHeaders(req, res);
-    try {
-        const isInitialized = initializationPromise !== null;
-        const summary = zktecoService?.getSummary ? zktecoService.getSummary() : {};
         res.json({
             success: true,
-            status: zktecoService?.isConnected ? 'healthy' : 'device unreachable',
-            timestamp: new Date().toISOString(),
-            service: {
-                initialized: isInitialized,
-                connected: zktecoService?.isConnected || false,
-                realData: summary.isRealData || false,
-                deviceIp: zktecoService?.ip || 'not set'
-            },
-            data: {
-                users: summary.totalUsers || 0,
-                logs: summary.totalLogs || 0,
-                records: summary.totalRecords || 0,
-                lastUpdate: summary.lastUpdate || new Date().toISOString()
-            },
-            system: {
-                uptime: process.uptime(),
-                memory: process.memoryUsage(),
-                node: process.version
-            }
+            count: rows.length,
+            data: rows,
+            fetchedAt: new Date().toISOString(),
         });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message, status: 'unhealthy' });
-    }
-});
 
-// Routes principales
-router.get('/users', ensureInitialized, async (req, res) => {
-    try {
-        const users = zktecoService.getUsers();
-        res.json({
-            success: true,
-            count: users.length,
-            users: users,
-            metadata: {
-                realData: zktecoService.isConnected,
-                deviceIp: zktecoService.ip,
-                lastUpdate: new Date().toISOString()
-            }
-        });
     } catch (error) {
+        console.error('❌ GET /attendance error:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-router.get('/logs', ensureInitialized, async (req, res) => {
+// ══════════════════════════════════════════════════════════════
+// GET /api/employees
+// Returns all employees from attendance DB
+// ══════════════════════════════════════════════════════════════
+router.get('/employees', async (req, res) => {
     try {
-        const logs = zktecoService.getAttendanceLogs();
-        const limit = parseInt(req.query.limit) || 100;
-        const offset = parseInt(req.query.offset) || 0;
-        const paginatedLogs = logs.slice(offset, offset + limit);
+        const { rows } = await global.attendancePool.query(`
+            SELECT
+                uid,
+                matricule,
+                pointeuse_user_id AS "pointeuseUserId",
+                full_name         AS name,
+                card_no           AS "cardNo",
+                updated_at        AS "updatedAt"
+            FROM public.employees
+            ORDER BY full_name ASC
+        `);
+
         res.json({
             success: true,
-            count: logs.length,
-            pagination: { limit, offset, total: logs.length, hasMore: offset + limit < logs.length },
-            logs: paginatedLogs,
-            metadata: { realData: zktecoService.isConnected, deviceIp: zktecoService.ip, lastUpdate: new Date().toISOString() }
+            count: rows.length,
+            employees: rows,
         });
+
     } catch (error) {
+        console.error('❌ GET /employees error:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-router.get('/attendance', ensureInitialized, async (req, res) => {
-    try {
-        const data = zktecoService.getProcessedData();
-        const limit = parseInt(req.query.limit) || 100;
-        const offset = parseInt(req.query.offset) || 0;
-        const paginatedData = data.slice(offset, offset + limit);
-        res.json({
-            success: true,
-            count: data.length,
-            pagination: { limit, offset, total: data.length, hasMore: offset + limit < data.length },
-            data: paginatedData,
-            metadata: {
-                realData: zktecoService.isConnected,
-                deviceIp: zktecoService.ip,
-                lastUpdate: new Date().toISOString(),
-                summary: zktecoService.getSummary ? zktecoService.getSummary() : {}
-            }
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.post('/refresh', ensureInitialized, async (req, res) => {
-    try {
-        console.log('🔄 Rafraîchissement des données demandé...');
-        const result = await zktecoService.fetchAllData();
-        const data = zktecoService.getProcessedData();
-        const summary = zktecoService.getSummary();
-        res.json({
-            success: true,
-            message: 'Données rafraîchies avec succès',
-            result: result,
-            summary: summary,
-            data: { count: data.length, sample: data.slice(0, 5) },
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message,
-            hint: 'Check port forwarding on office router: port 4370 → 10.10.205.10'
-        });
-    }
-});
-
-router.get('/summary', ensureInitialized, async (req, res) => {
-    try {
-        const summary = zktecoService.getSummary();
-        const detailed = req.query.detailed === 'true';
-        if (detailed && zktecoService.getDetailedStats) {
-            const stats = zktecoService.getDetailedStats();
-            res.json({ success: true, summary: summary, detailedStats: stats });
-        } else {
-            res.json({ success: true, summary: summary });
-        }
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.get('/today', ensureInitialized, async (req, res) => {
+// ══════════════════════════════════════════════════════════════
+// GET /api/summary
+// Returns summary stats from DB
+// ══════════════════════════════════════════════════════════════
+router.get('/summary', async (req, res) => {
     try {
         const today = new Date().toISOString().split('T')[0];
-        const data = zktecoService.getDataByDate(today);
-        const employees = zktecoService.getUsers();
-        const stats = {
-            total: employees.length,
-            present: data.filter(r => r.status === 'Présent' || r.status === "À l'heure").length,
-            late: data.filter(r => r.status === 'En retard').length,
-            inProgress: data.filter(r => r.status === 'En cours').length,
-            absent: employees.length - data.length,
-            averageHours: 0
-        };
-        const withHours = data.filter(r => r.hoursWorked && parseFloat(r.hoursWorked) > 0);
-        if (withHours.length > 0) {
-            stats.averageHours = (withHours.reduce((sum, r) => sum + parseFloat(r.hoursWorked), 0) / withHours.length).toFixed(2);
-        }
+
+        const [totalEmployees, todayStats, totalRecords, lastSync] = await Promise.all([
+            // Total employees
+            global.attendancePool.query(
+                `SELECT COUNT(*) AS count FROM public.employees`
+            ),
+            // Today's stats
+            global.attendancePool.query(`
+                SELECT
+                    COUNT(*) FILTER (WHERE status != 'Absent') AS present,
+                    COUNT(*) FILTER (WHERE status = 'En retard') AS late,
+                    COUNT(*) FILTER (WHERE status = 'En cours') AS in_progress,
+                    COUNT(*) FILTER (WHERE status = 'Absent') AS absent
+                FROM public.attendance_daily
+                WHERE work_date = $1
+            `, [today]),
+            // Total records
+            global.attendancePool.query(
+                `SELECT COUNT(*) AS count FROM public.attendance_daily`
+            ),
+            // Last sync
+            global.attendancePool.query(`
+                SELECT started_at, finished_at, success, message
+                FROM public.sync_runs
+                ORDER BY started_at DESC
+                LIMIT 1
+            `),
+        ]);
+
+        const sync = lastSync.rows[0] || null;
+
         res.json({
             success: true,
-            date: today,
-            dayName: zktecoService.getDayName(new Date().getDay()),
-            stats: stats,
-            count: data.length,
-            totalEmployees: employees.length,
-            data: data
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.get('/by-date/:date', ensureInitialized, async (req, res) => {
-    try {
-        const { date } = req.params;
-        const data = zktecoService.getDataByDate(date);
-        const employees = zktecoService.getUsers();
-        const employeeMap = new Map();
-        employees.forEach(emp => {
-            employeeMap.set(emp.uid, {
-                uid: emp.uid,
-                userId: emp.userid,
-                pointeuseUserId: emp.pointeuseUserId,
-                name: emp.name,
-                cardNo: emp.cardno,
-                date: date,
-                dayName: zktecoService.getDayName(new Date(date).getDay()),
-                arrivalTime: null,
-                departureTime: null,
-                hoursWorked: '0.00',
-                entries: [],
-                status: 'Absent'
-            });
-        });
-        data.forEach(record => { employeeMap.set(record.uid, record); });
-        const completeData = Array.from(employeeMap.values()).sort((a, b) => a.name.localeCompare(b.name));
-        const stats = {
-            total: employees.length,
-            present: completeData.filter(r => r.status === 'Présent' || r.status === "À l'heure").length,
-            late: completeData.filter(r => r.status === 'En retard').length,
-            inProgress: completeData.filter(r => r.status === 'En cours').length,
-            absent: completeData.filter(r => r.status === 'Absent').length,
-            averageHours: 0
-        };
-        const withHours = completeData.filter(r => r.hoursWorked && parseFloat(r.hoursWorked) > 0);
-        if (withHours.length > 0) {
-            stats.averageHours = (withHours.reduce((sum, r) => sum + parseFloat(r.hoursWorked), 0) / withHours.length).toFixed(2);
-        }
-        res.json({
-            success: true,
-            date: date,
-            dayName: zktecoService.getDayName(new Date(date).getDay()),
-            stats: stats,
-            totalEmployees: employees.length,
-            data: completeData
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.get('/by-employee/:uid', ensureInitialized, async (req, res) => {
-    try {
-        const { uid } = req.params;
-        const data = zktecoService.getEmployeeData(uid);
-        const user = zktecoService.getUsers().find(u => u.uid.toString() === uid.toString());
-        if (!user) {
-            return res.status(404).json({ success: false, error: 'Employé non trouvé' });
-        }
-        const stats = {
-            totalDays: data.length,
-            presentDays: data.filter(r => r.status === 'Présent' || r.status === "À l'heure").length,
-            lateDays: data.filter(r => r.status === 'En retard').length,
-            inProgressDays: data.filter(r => r.status === 'En cours').length,
-            absentDays: 0,
-            totalHours: 0,
-            averageHours: 0,
-            earliestDate: data.length > 0 ? data[data.length - 1].date : null,
-            latestDate: data.length > 0 ? data[0].date : null
-        };
-        const daysWithHours = data.filter(r => r.hoursWorked && parseFloat(r.hoursWorked) > 0);
-        if (daysWithHours.length > 0) {
-            stats.totalHours = daysWithHours.reduce((sum, r) => sum + parseFloat(r.hoursWorked), 0).toFixed(2);
-            stats.averageHours = (stats.totalHours / daysWithHours.length).toFixed(2);
-        }
-        res.json({
-            success: true,
-            employee: { uid: user.uid, userId: user.userid, pointeuseUserId: user.pointeuseUserId, name: user.name, cardNo: user.cardno },
-            stats: stats,
-            count: data.length,
-            data: data
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.get('/by-employee/:uid/date/:date', ensureInitialized, async (req, res) => {
-    try {
-        const { uid, date } = req.params;
-        const data = zktecoService.getEmployeeDayData(uid, date);
-        const user = zktecoService.getUsers().find(u => u.uid.toString() === uid.toString());
-        if (!user) {
-            return res.status(404).json({ success: false, error: 'Employé non trouvé' });
-        }
-        if (!data) {
-            return res.json({
-                success: true,
-                employee: { uid: user.uid, userId: user.userid, pointeuseUserId: user.pointeuseUserId, name: user.name, cardNo: user.cardno },
-                date: date,
-                data: {
-                    uid: user.uid, userId: user.userid, pointeuseUserId: user.pointeuseUserId,
-                    name: user.name, cardNo: user.cardno, date: date,
-                    dayName: zktecoService.getDayName(new Date(date).getDay()),
-                    arrivalTime: null, departureTime: null, hoursWorked: '0.00', entries: [], status: 'Absent'
-                }
-            });
-        }
-        res.json({
-            success: true,
-            employee: { uid: user.uid, userId: user.userid, pointeuseUserId: user.pointeuseUserId, name: user.name, cardNo: user.cardno },
-            date: date,
-            data: data
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.get('/available-dates', ensureInitialized, async (req, res) => {
-    try {
-        const data = zktecoService.getProcessedData();
-        const dates = [...new Set(data.map(r => r.date))].sort().reverse();
-        const datesWithStats = dates.map(date => {
-            const dayData = zktecoService.getDataByDate(date);
-            const employees = zktecoService.getUsers();
-            return {
-                date: date,
-                dayName: zktecoService.getDayName(new Date(date).getDay()),
-                totalEmployees: employees.length,
-                present: dayData.filter(r => r.status === 'Présent' || r.status === "À l'heure").length,
-                late: dayData.filter(r => r.status === 'En retard').length,
-                inProgress: dayData.filter(r => r.status === 'En cours').length,
-                absent: employees.length - dayData.length,
-                totalHours: dayData.reduce((sum, r) => sum + (parseFloat(r.hoursWorked) || 0), 0).toFixed(2)
-            };
-        });
-        res.json({ success: true, count: dates.length, dates: datesWithStats });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.get('/report/:startDate/:endDate', ensureInitialized, async (req, res) => {
-    try {
-        const { startDate, endDate } = req.params;
-        const data = zktecoService.getProcessedData();
-        const filteredData = data.filter(r => r.date >= startDate && r.date <= endDate);
-        const stats = {
-            period: { start: startDate, end: endDate },
-            totalDays: new Set(filteredData.map(r => r.date)).size,
-            totalRecords: filteredData.length,
-            byDay: {},
-            byEmployee: {}
-        };
-        filteredData.forEach(record => {
-            if (!stats.byDay[record.date]) {
-                stats.byDay[record.date] = { date: record.date, dayName: record.dayName, present: 0, late: 0, inProgress: 0, totalHours: 0 };
-            }
-            if (record.status === 'Présent' || record.status === "À l'heure") stats.byDay[record.date].present++;
-            else if (record.status === 'En retard') stats.byDay[record.date].late++;
-            else if (record.status === 'En cours') stats.byDay[record.date].inProgress++;
-            if (record.hoursWorked && parseFloat(record.hoursWorked) > 0) {
-                stats.byDay[record.date].totalHours += parseFloat(record.hoursWorked);
-            }
-        });
-        zktecoService.getUsers().forEach(user => {
-            const empData = filteredData.filter(r => r.uid === user.uid);
-            const empWithHours = empData.filter(r => r.hoursWorked && parseFloat(r.hoursWorked) > 0);
-            stats.byEmployee[user.uid] = {
-                uid: user.uid, name: user.name, matricule: user.userid,
-                totalDays: empData.length,
-                presentDays: empData.filter(r => r.status === 'Présent' || r.status === "À l'heure").length,
-                lateDays: empData.filter(r => r.status === 'En retard').length,
-                inProgressDays: empData.filter(r => r.status === 'En cours').length,
-                totalHours: empWithHours.reduce((sum, r) => sum + parseFloat(r.hoursWorked), 0).toFixed(2),
-                averageHours: empWithHours.length > 0 ?
-                    (empWithHours.reduce((sum, r) => sum + parseFloat(r.hoursWorked), 0) / empWithHours.length).toFixed(2) : 0
-            };
-        });
-        res.json({ success: true, stats: stats, data: filteredData });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// Routes de débogage
-router.get('/debug/mapping', ensureInitialized, async (req, res) => {
-    try {
-        const users = zktecoService.getUsers();
-        const logs = zktecoService.getAttendanceLogs();
-        const processed = zktecoService.getProcessedData();
-        const sampleLogs = logs.slice(0, 20).map(log => {
-            let matchedUser = users.find(u => u.uid === log.uid);
-            if (!matchedUser && log.userid) matchedUser = users.find(u => u.userid === log.userid);
-            if (!matchedUser && log.pointeuseUserId) matchedUser = users.find(u => u.pointeuseUserId === log.pointeuseUserId);
-            return {
-                log: {
-                    uid: log.uid,
-                    userid: log.userid,
-                    pointeuseUserId: log.pointeuseUserId,
-                    timestamp: log.timestamp instanceof Date
-                        ? log.timestamp.toISOString()
-                        : (log.timestamp ? String(log.timestamp) : 'null'),
-                    type: log.type
+            summary: {
+                totalEmployees: parseInt(totalEmployees.rows[0].count),
+                totalRecords: parseInt(totalRecords.rows[0].count),
+                today: {
+                    date: today,
+                    present: parseInt(todayStats.rows[0].present),
+                    late: parseInt(todayStats.rows[0].late),
+                    inProgress: parseInt(todayStats.rows[0].in_progress),
+                    absent: parseInt(todayStats.rows[0].absent),
                 },
-                matchedUser: matchedUser ? { uid: matchedUser.uid, userid: matchedUser.userid, pointeuseUserId: matchedUser.pointeuseUserId, name: matchedUser.name } : null
-            };
-        });
-        const matchedCount = sampleLogs.filter(item => item.matchedUser).length;
-        const unmatchedCount = sampleLogs.filter(item => !item.matchedUser).length;
-        const logUIDs = [...new Set(logs.map(l => l.uid))].slice(0, 20);
-        const userUIDs = [...new Set(users.map(u => u.uid))].slice(0, 20);
-        res.json({
-            success: true,
-            stats: {
-                users: users.length, logs: logs.length, processed: processed.length,
-                sampleSize: sampleLogs.length, matched: matchedCount, unmatched: unmatchedCount,
-                matchRate: sampleLogs.length > 0 ? ((matchedCount / sampleLogs.length) * 100).toFixed(2) + '%' : '0%'
+                lastSync: sync ? {
+                    startedAt: sync.started_at,
+                    finishedAt: sync.finished_at,
+                    success: sync.success,
+                    message: sync.message,
+                } : null,
+                fetchedAt: new Date().toISOString(),
             },
-            logUIDs, userUIDs, sampleLogs,
-            usersSample: users.slice(0, 5),
-            logsSample: logs.slice(0, 5),
-            processedSample: processed.slice(0, 5),
-            realEmployees: zktecoService.realEmployees ? zktecoService.realEmployees.slice(0, 5) : []
         });
+
     } catch (error) {
+        console.error('❌ GET /summary error:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-router.get('/debug/users-raw', ensureInitialized, async (req, res) => {
-    try {
-        const users = zktecoService.getUsers();
-        res.json({ success: true, rawData: users, type: typeof users, isArray: Array.isArray(users), length: Array.isArray(users) ? users.length : 'N/A', sample: users.slice(0, 3) });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
+// ══════════════════════════════════════════════════════════════
+// POST /api/sync
+// Manually trigger a device sync
+// Frontend calls this when user clicks "Refresh"
+// ══════════════════════════════════════════════════════════════
+router.post('/sync', async (req, res) => {
+    const zktecoService = req.app.locals.zktecoService;
 
-router.get('/debug/logs-raw', ensureInitialized, async (req, res) => {
-    try {
-        const logs = zktecoService.getAttendanceLogs();
-        res.json({ success: true, rawData: logs, type: typeof logs, isArray: Array.isArray(logs), length: Array.isArray(logs) ? logs.length : 'N/A', sample: logs.slice(0, 3) });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+    if (!zktecoService) {
+        return res.status(503).json({ success: false, error: 'ZKTeco service not available' });
     }
-});
 
-router.get('/test-connection', async (req, res) => {
-    setCORSHeaders(req, res);
-    try {
-        const result = await zktecoService.testConnection();
-        res.json(result);
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.get('/real-employees', async (req, res) => {
-    setCORSHeaders(req, res);
-    try {
-        if (!zktecoService) return res.status(503).json({ success: false, error: 'Service not available' });
-        if (zktecoService.realEmployees && zktecoService.realEmployees.length > 0) {
-            res.json({ success: true, count: zktecoService.realEmployees.length, employees: zktecoService.realEmployees });
-        } else {
-            const users = zktecoService.getUsers();
-            res.json({ success: true, count: users.length, employees: users.map(user => ({ uid: user.uid, name: user.name, matricule: user.userid, pointeuseUserId: user.pointeuseUserId })) });
-        }
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.get('/debug/test-correspondance', ensureInitialized, async (req, res) => {
-    try {
-        const logs = zktecoService.getAttendanceLogs();
-        const users = zktecoService.getUsers();
-        const testResults = [];
-        const logSample = logs.slice(0, 20);
-        logSample.forEach(log => {
-            const logUserId = log.uid.toString();
-            const logPointeuseUserId = log.pointeuseUserId;
-            let matchedUser = users.find(u => u.pointeuseUserId === logPointeuseUserId);
-            if (!matchedUser) matchedUser = users.find(u => u.userid === logUserId);
-            if (!matchedUser && zktecoService.realEmployees) {
-                const realEmp = zktecoService.realEmployees.find(e =>
-                    e.pointeuseUserId === logPointeuseUserId ||
-                    e.pointeuseUserId === logUserId ||
-                    e.matricule === logUserId
-                );
-                if (realEmp) matchedUser = users.find(u => u.uid === realEmp.uid);
-            }
-            testResults.push({
-                log: { uid: logUserId, pointeuseUserId: logPointeuseUserId, timestamp: log.timestamp, type: log.type },
-                matched: matchedUser ? { uid: matchedUser.uid, name: matchedUser.name, matricule: matchedUser.userid, pointeuseUserId: matchedUser.pointeuseUserId } : null,
-                matchType: matchedUser ? 'SUCCESS' : 'FAILED'
-            });
+    if (zktecoService.isSyncing) {
+        return res.json({
+            success: false,
+            message: 'Sync already in progress, please wait',
+            status: zktecoService.getStatus(),
         });
-        const successCount = testResults.filter(r => r.matchType === 'SUCCESS').length;
-        const failCount = testResults.filter(r => r.matchType === 'FAILED').length;
+    }
+
+    try {
+        console.log('🔄 Manual sync triggered via API');
+        const result = await zktecoService.runSync();
         res.json({
             success: true,
-            stats: {
-                totalLogs: logs.length, sampleSize: logSample.length,
-                successCount, failCount,
-                successRate: logSample.length > 0 ? `${((successCount / logSample.length) * 100).toFixed(1)}%` : '0%'
-            },
-            testResults,
-            allPointeuseUserIds: [...new Set(logs.map(l => l.pointeuseUserId).filter(id => id && id !== '0'))].sort(),
-            realEmployees: zktecoService.realEmployees ? zktecoService.realEmployees.map(emp => ({ name: emp.name, matricule: emp.matricule, pointeuseUserId: emp.pointeuseUserId })) : []
+            message: 'Sync completed successfully',
+            result,
+            status: zktecoService.getStatus(),
         });
+    } catch (error) {
+        console.error('❌ Manual sync failed:', error.message);
+        res.status(500).json({
+            success: false,
+            error: `Sync failed: ${error.message}`,
+            hint: 'Device may be offline. Data served from last successful sync.',
+            status: zktecoService.getStatus(),
+        });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════
+// GET /api/sync/history
+// Returns last 10 sync runs
+// ══════════════════════════════════════════════════════════════
+router.get('/sync/history', async (req, res) => {
+    try {
+        const { rows } = await global.attendancePool.query(`
+            SELECT id, started_at, finished_at, success, message, details
+            FROM public.sync_runs
+            ORDER BY started_at DESC
+            LIMIT 10
+        `);
+        res.json({ success: true, history: rows });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-router.get('/debug/raw-attendances', ensureInitialized, async (req, res) => {
+// ══════════════════════════════════════════════════════════════
+// GET /api/sync/status
+// Returns current sync status
+// ══════════════════════════════════════════════════════════════
+router.get('/sync/status', (req, res) => {
+    const zktecoService = req.app.locals.zktecoService;
+    if (!zktecoService) {
+        return res.status(503).json({ success: false, error: 'Service not available' });
+    }
+    res.json({ success: true, status: zktecoService.getStatus() });
+});
+
+// ══════════════════════════════════════════════════════════════
+// GET /api/health
+// Quick health check
+// ══════════════════════════════════════════════════════════════
+router.get('/health', async (req, res) => {
     try {
-        console.log('🔍 Test direct de getAttendances()...');
-        const device = zktecoService.device;
-        if (!device) return res.status(500).json({ success: false, error: 'Device non initialisé' });
-        const methods = ['getAttendances', 'getAttLogs', 'getAttendanceLogs'];
-        let result = null;
-        let methodUsed = '';
-        for (const method of methods) {
-            if (device[method] && typeof device[method] === 'function') {
-                try {
-                    console.log(`🔄 Essai de la méthode: ${method}`);
-                    result = await device[method]();
-                    methodUsed = method;
-                    console.log(`✅ Méthode ${method} réussie`);
-                    break;
-                } catch (error) {
-                    console.log(`❌ Méthode ${method} échouée:`, error.message);
-                }
-            }
-        }
-        if (!result) return res.status(500).json({ success: false, error: 'Aucune méthode getAttendances ne fonctionne' });
-        const rawData = result.data || result;
+        await global.attendancePool.query('SELECT 1');
+        const zktecoService = req.app.locals.zktecoService;
         res.json({
             success: true,
-            methodUsed,
-            resultStructure: { hasDataProperty: result.data !== undefined, dataIsArray: Array.isArray(result.data), dataLength: Array.isArray(result.data) ? result.data.length : 'N/A', rawKeys: Object.keys(result) },
-            sampleLog: Array.isArray(rawData) && rawData.length > 0 ? rawData[0] : null,
-            totalLogs: Array.isArray(rawData) ? rawData.length : 0
+            status: 'healthy',
+            database: 'connected',
+            sync: zktecoService ? zktecoService.getStatus() : null,
+            timestamp: new Date().toISOString(),
         });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.get('/debug/force-match/:matricule', ensureInitialized, async (req, res) => {
-    try {
-        const { matricule } = req.params;
-        const employee = zktecoService.realEmployees.find(emp => emp.matricule === matricule);
-        if (!employee) return res.status(404).json({ success: false, error: 'Employé non trouvé' });
-        const logs = zktecoService.getAttendanceLogs();
-        const userLogs = logs.filter(log =>
-            log.userid === matricule ||
-            log.uid.toString() === matricule ||
-            log.pointeuseUserId === employee.pointeuseUserId ||
-            (log.pointeuseUserId && log.pointeuseUserId.includes(matricule))
-        );
-        const processedLogs = userLogs.reduce((acc, log) => {
-            const date = new Date(log.timestamp);
-            const dateKey = date.toISOString().split('T')[0];
-            const key = `${employee.uid}-${dateKey}`;
-            if (!acc[key]) {
-                acc[key] = {
-                    uid: employee.uid, userId: employee.matricule, pointeuseUserId: employee.pointeuseUserId,
-                    name: employee.name, cardNo: `EMP${employee.matricule.padStart(3, '0')}`,
-                    date: dateKey, dayName: zktecoService.getDayName(date.getDay()),
-                    entries: [], hoursWorked: 0, arrivalTime: null, departureTime: null, status: 'Absent'
-                };
-            }
-            const hour = date.getHours();
-            const minute = date.getMinutes();
-            acc[key].entries.push({ timestamp: log.timestamp, time: `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`, hour, minute, type: log.type });
-            return acc;
-        }, {});
-        const processedData = Object.values(processedLogs).map(record => {
-            record.entries.sort((a, b) => { if (a.hour !== b.hour) return a.hour - b.hour; return a.minute - b.minute; });
-            const arrivalEntries = record.entries.filter(e => e.type === 0);
-            const departureEntries = record.entries.filter(e => e.type === 1);
-            if (arrivalEntries.length > 0) { record.arrivalTime = arrivalEntries[0].time; record.status = arrivalEntries[0].hour > 9 ? 'En retard' : 'Présent'; }
-            if (departureEntries.length > 0) { record.departureTime = departureEntries[departureEntries.length - 1].time; }
-            if (record.arrivalTime && record.departureTime) {
-                const arrivalParts = record.arrivalTime.split(':');
-                const departureParts = record.departureTime.split(':');
-                let totalMinutes = (parseInt(departureParts[0]) * 60 + parseInt(departureParts[1])) - (parseInt(arrivalParts[0]) * 60 + parseInt(arrivalParts[1]));
-                if (totalMinutes > 240) totalMinutes -= 60;
-                record.hoursWorked = (totalMinutes / 60).toFixed(2);
-            }
-            return record;
-        });
-        res.json({ success: true, employee, logsCount: userLogs.length, processedCount: processedData.length, logs: userLogs.slice(0, 10), processedData });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.post('/reset', async (req, res) => {
-    setCORSHeaders(req, res);
-    try {
-        if (!zktecoService) return res.status(503).json({ success: false, error: 'Service not available' });
-        console.log('🔄 Réinitialisation du service demandée...');
-        if (initializationPromise) initializationPromise = null;
-        if (zktecoService.disconnect) await zktecoService.disconnect();
-        zktecoService.users = [];
-        zktecoService.attendanceLogs = [];
-        zktecoService.processedData = [];
-        zktecoService.device = null;
-        zktecoService.isConnected = false;
-        await zktecoService.loadUsersFromDB();
-        await zktecoService.loadProcessedDataFromDB();
-        initializeService().catch(err => {
-            console.warn('⚠️ Device reconnection after reset failed:', err.message);
-        });
-        res.json({ success: true, message: 'Service réinitialisé avec succès', timestamp: new Date().toISOString() });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({ success: false, status: 'unhealthy', error: error.message });
     }
 });
 
 module.exports = router;
-module.exports.setZktecoService = setZktecoService;
