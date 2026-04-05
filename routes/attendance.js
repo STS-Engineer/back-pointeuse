@@ -146,46 +146,6 @@ router.get('/summary', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// POST /api/sync
-// Manually trigger a device sync
-// Frontend calls this when user clicks "Refresh"
-// ══════════════════════════════════════════════════════════════
-router.post('/sync', async (req, res) => {
-    const zktecoService = req.app.locals.zktecoService;
-
-    if (!zktecoService) {
-        return res.status(503).json({ success: false, error: 'ZKTeco service not available' });
-    }
-
-    if (zktecoService.isSyncing) {
-        return res.json({
-            success: false,
-            message: 'Sync already in progress, please wait',
-            status: zktecoService.getStatus(),
-        });
-    }
-
-    try {
-        console.log('🔄 Manual sync triggered via API');
-        const result = await zktecoService.runSync();
-        res.json({
-            success: true,
-            message: 'Sync completed successfully',
-            result,
-            status: zktecoService.getStatus(),
-        });
-    } catch (error) {
-        console.error('❌ Manual sync failed:', error.message);
-        res.status(500).json({
-            success: false,
-            error: `Sync failed: ${error.message}`,
-            hint: 'Device may be offline. Data served from last successful sync.',
-            status: zktecoService.getStatus(),
-        });
-    }
-});
-
-// ══════════════════════════════════════════════════════════════
 // GET /api/sync/history
 // Returns last 10 sync runs
 // ══════════════════════════════════════════════════════════════
@@ -204,30 +164,16 @@ router.get('/sync/history', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
-// GET /api/sync/status
-// Returns current sync status
-// ══════════════════════════════════════════════════════════════
-router.get('/sync/status', (req, res) => {
-    const zktecoService = req.app.locals.zktecoService;
-    if (!zktecoService) {
-        return res.status(503).json({ success: false, error: 'Service not available' });
-    }
-    res.json({ success: true, status: zktecoService.getStatus() });
-});
-
-// ══════════════════════════════════════════════════════════════
 // GET /api/health
 // Quick health check
 // ══════════════════════════════════════════════════════════════
 router.get('/health', async (req, res) => {
     try {
         await global.attendancePool.query('SELECT 1');
-        const zktecoService = req.app.locals.zktecoService;
         res.json({
             success: true,
             status: 'healthy',
             database: 'connected',
-            sync: zktecoService ? zktecoService.getStatus() : null,
             timestamp: new Date().toISOString(),
         });
     } catch (error) {
