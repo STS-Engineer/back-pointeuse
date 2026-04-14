@@ -16,12 +16,14 @@
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "moment-timezone": "^0.5.43",
     "helmet": "^7.0.0",
     "morgan": "^1.10.0",
     "compression": "^1.7.4",
     "dotenv": "^16.0.3",
-    "pg": "^8.11.3"
+    "pg": "^8.11.3",
+    "moment-timezone": "^0.5.43",
+    "node-cron": "^3.0.3",
+    "zkteco-js": "^1.0.9"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
