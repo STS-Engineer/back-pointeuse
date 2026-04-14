@@ -5,6 +5,8 @@ const helmet = require('helmet');
 const compression = require('compression');
 const morgan = require('morgan');
 const { Pool } = require('pg');
+const cron = require('node-cron');        // ← ADD
+const { runOnce } = require('./ingestion/ingest'); // ← ADD
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -89,6 +91,20 @@ const server = app.listen(PORT, () => {
   📊 Summary:         GET  /api/summary
   📅 Last Syncs:      GET  /api/sync/history
     `);
+
+    // ── Ingestion cron job (every hour) ───────────────────────
+    cron.schedule('0 * * * *', async () => {
+        console.log(`\n⏰ [CRON] Starting ingestion at ${new Date().toISOString()}`);
+        try {
+            await runOnce();
+            console.log('✅ [CRON] Ingestion completed successfully');
+        } catch (err) {
+            console.error('❌ [CRON] Ingestion failed:', err.message);
+            // ← never crashes the server, just logs the error
+        }
+    });
+
+    console.log('⏰ Ingestion cron job scheduled — runs every hour');
 });
 
 // ── Graceful shutdown ──────────────────────────────────────────
