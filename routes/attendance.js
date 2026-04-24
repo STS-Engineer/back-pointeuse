@@ -47,13 +47,6 @@ function parseLocalDate(dateStr) {
     return new Date(y, m - 1, d);
 }
 
-// ✅ FIX 1: SAFE DATE HANDLING
-function safeDateStr(value) {
-    if (!value) return null;
-    if (value instanceof Date) return value.toISOString().split('T')[0];
-    return String(value).split('T')[0];
-}
-
 function normalizeTypeDemande(value) {
     return String(value || '')
         .normalize('NFD')
@@ -88,7 +81,6 @@ function getLateMinutes(arrivalTime) {
     return mins - LATE_THRESHOLD;
 }
 
-// ✅ FIX 2: AUTORISATION SUPPORT IN LATE JUSTIFICATION
 function isLateJustified(arrivalTime, requestsForDay) {
     const arrival = toMinutesFromTime(arrivalTime);
     if (arrival === null || arrival <= LATE_THRESHOLD) return false;
@@ -134,8 +126,8 @@ function getRequestDatesInRange(request, startDateStr, endDateStr) {
     const reportEnd = parseLocalDate(endDateStr);
 
     const type = normalizeTypeDemande(request.type_demande);
-    const requestStart = parseLocalDate(safeDateStr(request.date_depart));
-    const requestEnd = parseLocalDate(safeDateStr(request.date_retour) || safeDateStr(request.date_depart));
+    const requestStart = parseLocalDate(String(request.date_depart).split('T')[0]);
+    const requestEnd = parseLocalDate(String(request.date_retour || request.date_depart).split('T')[0]);
 
     const effectiveStart = requestStart > reportStart ? requestStart : reportStart;
     const effectiveEnd = requestEnd < reportEnd ? requestEnd : reportEnd;
@@ -149,8 +141,6 @@ function getRequestDatesInRange(request, startDateStr, endDateStr) {
         }
         return result;
     }
-
-    if (effectiveStart > effectiveEnd) return result;
 
     const cursor = new Date(effectiveStart);
 
@@ -169,8 +159,8 @@ function getMissionDayMinutes(req, currentDate) {
     const type = normalizeTypeDemande(req.type_demande);
     if (type !== 'mission') return 0;
 
-    const startDate = safeDateStr(req.date_depart);
-    const endDate = safeDateStr(req.date_retour) || startDate;
+    const startDate = String(req.date_depart).split('T')[0];
+    const endDate = String(req.date_retour || req.date_depart).split('T')[0];
 
     if (currentDate < startDate || currentDate > endDate) return 0;
 
@@ -213,7 +203,6 @@ function buildApprovedRequestMap(requestRows, startDateStr, endDateStr) {
     return map;
 }
 
-// ✅ FIX 3: HALF-DAY CONGÉ HANDLING
 function computeDayResult(attendanceRow, requestsForDay, currentDate) {
     const arrival = attendanceRow?.arrival_time ? formatTimeHHMM(attendanceRow.arrival_time) : null;
     const departure = attendanceRow?.departure_time ? formatTimeHHMM(attendanceRow.departure_time) : null;
@@ -225,7 +214,7 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate) {
 
     const conge = conges[0] || null;
 
-    if (conge) {
+    if (conge && !hasAttendance) {
         if (conge.demi_journee) {
             return {
                 workedMinutes: 240,
@@ -674,16 +663,16 @@ router.get('/report', async (req, res) => {
             totalLateCount += empLateCount;
             totalLateMinutes += empLateMinutes;
 
-        if (!hasAttendance) {
             return {
-                workedMinutes: 0,
-                displayText: 'Congé',
-                isLate: false,
-                lateMinutes: 0,
-                lateJustified: false,
-                status: 'conge',
-                arrival: null,
-                departure: null,
+                uid: emp.uid,
+                name: emp.name,
+                cardNo: emp.cardNo,
+                matricule: emp.matricule,
+                totalMinutes: empTotalMinutes,
+                totalHours: formatMinutesToHours(empTotalMinutes),
+                lateCount: empLateCount,
+                lateMinutes: empLateMinutes,
+                days,
             };
         });
 
