@@ -1,3 +1,4 @@
+
 const express = require('express');
 const router = express.Router();
 
@@ -47,6 +48,15 @@ function parseLocalDate(dateStr) {
     return new Date(y, m - 1, d);
 }
 
+// ✅ FIX 1: Safe date string extraction — handles PostgreSQL Date objects correctly
+// String(dateObject) gives "Mon Apr 20 2026 ..." which is wrong
+// dateObject.toISOString() gives "2026-04-20T00:00:00.000Z" which is correct
+function safeDateStr(value) {
+    if (!value) return null;
+    if (value instanceof Date) return value.toISOString().split('T')[0];
+    return String(value).split('T')[0];
+}
+
 function normalizeTypeDemande(value) {
     return String(value || '')
         .normalize('NFD')
@@ -55,7 +65,10 @@ function normalizeTypeDemande(value) {
         .toLowerCase();
 }
 
-// Compute worked minutes after 1h lunch break deduction
+function normalizeMatricule(value) {
+    return String(value || '').trim();
+}
+
 function computeWorkedMinutes(arrivalTime, departureTime, lunchBreakMinutes = 60) {
     const arrival = toMinutesFromTime(arrivalTime);
     const departure = toMinutesFromTime(departureTime);
@@ -65,7 +78,6 @@ function computeWorkedMinutes(arrivalTime, departureTime, lunchBreakMinutes = 60
     return Math.max(0, raw - deduction);
 }
 
-// Late threshold: 08:30
 const LATE_THRESHOLD = 8 * 60 + 30;
 
 function isLate(arrivalTime) {
@@ -135,7 +147,6 @@ function getAuthorizationMinutes(req) {
     return end - start;
 }
 
-// Enumerate weekdays (Mon-Fri) in a date range using LOCAL dates
 function enumerateWeekdays(startDateStr, endDateStr) {
     const dates = [];
     const current = parseLocalDate(startDateStr);
@@ -152,28 +163,28 @@ function enumerateWeekdays(startDateStr, endDateStr) {
     return dates;
 }
 
-// Get which dates in range a request covers
-// Business rule:
-// - autorisation = single-day
-// - mission = range-based
-// - conges = range-based
-// - for range-based requests, date_retour is treated as RETURN day and excluded
+// ✅ FIX 1 APPLIED: Use safeDateStr() instead of String(...).split('T')[0]
+// String(postgresDateObject) returns "Mon Apr 20 2026 02:00:00 GMT+0200"
+// which makes parseLocalDate() produce NaN → effectiveEnd = NaN → cursor runs forever
 function getRequestDatesInRange(request, startDateStr, endDateStr) {
     const result = [];
     const reportStart = parseLocalDate(startDateStr);
     const reportEnd = parseLocalDate(endDateStr);
-    
+
     const type = normalizeTypeDemande(request.type_demande);
-    const requestStart = parseLocalDate(request.date_depart);
-    const requestEnd = parseLocalDate(request.date_retour || request.date_depart);
-    
-    // ⭐ Déterminer la plage réelle de la demande
-    let effectiveStart = requestStart > reportStart ? requestStart : reportStart;
-    let effectiveEnd = requestEnd < reportEnd ? requestEnd : reportEnd;
-    
-    // Pour les autorisations (toujours 1 jour)
+
+    const departStr = safeDateStr(request.date_depart);
+    const retourStr = safeDateStr(request.date_retour);
+
+    if (!departStr) return result;
+
+    const requestStart = parseLocalDate(departStr);
+    const requestEnd = parseLocalDate(retourStr || departStr);
+
+    const effectiveStart = requestStart > reportStart ? requestStart : reportStart;
+    const effectiveEnd = requestEnd < reportEnd ? requestEnd : reportEnd;
+
     if (type === 'autorisation') {
-        // Vérifier si la date de l'autorisation est dans la plage du rapport
         if (requestStart >= reportStart && requestStart <= reportEnd) {
             const day = requestStart.getDay();
             if (day >= 1 && day <= 5) {
@@ -182,73 +193,57 @@ function getRequestDatesInRange(request, startDateStr, endDateStr) {
         }
         return result;
     }
-    
-    // Pour les congés et missions (plage de dates)
-    // ⭐ CRITIQUE: Ne pas inclure les jours en dehors de la demande
+
+    // Guard: if no overlap, return empty
+    if (effectiveStart > effectiveEnd) return result;
+
     const cursor = new Date(effectiveStart);
-    
     while (cursor <= effectiveEnd) {
         const day = cursor.getDay();
-        if (day >= 1 && day <= 5) { // Uniquement jours ouvrés
+        if (day >= 1 && day <= 5) {
             result.push(formatLocalDate(cursor));
         }
         cursor.setDate(cursor.getDate() + 1);
     }
-    
+
     return result;
 }
-function sameDateStr(a, b) {
-    return String(a).split('T')[0] === String(b).split('T')[0];
-}
 
+// ✅ FIX 1 APPLIED here too: safeDateStr() for date comparisons
 function getMissionDayMinutes(req, currentDate) {
     const type = normalizeTypeDemande(req.type_demande);
     if (type !== 'mission') return 0;
 
-    // ⭐ Vérifier que currentDate est dans la plage de la mission
-    const startDate = String(req.date_depart).split('T')[0];
-    const endDate = String(req.date_retour || req.date_depart).split('T')[0];
-    
-    if (currentDate < startDate || currentDate > endDate) {
-        return 0; // Pas de mission ce jour
-    }
+    const startDate = safeDateStr(req.date_depart);
+    const endDate = safeDateStr(req.date_retour) || startDate;
+
+    if (!startDate) return 0;
+    if (currentDate < startDate || currentDate > endDate) return 0;
 
     const startMin = toMinutesFromTime(req.heure_depart);
     const endMin = toMinutesFromTime(req.heure_retour);
-    
-    const WORK_START = 8 * 60 + 30;   // 08:30
-    const WORK_END = 17 * 60 + 30;    // 17:30
 
-    // Mission sur un seul jour
+    const WORK_START = 8 * 60 + 30;
+    const WORK_END = 17 * 60 + 30;
+
     if (startDate === endDate) {
-        if (startMin !== null && endMin !== null && endMin > startMin) {
-            return endMin - startMin;
-        }
-        // Si pas d'heures spécifiées, journée complète de mission
-        return 8 * 60; // 8 heures
+        if (startMin !== null && endMin !== null && endMin > startMin) return endMin - startMin;
+        return 8 * 60;
     }
 
-    // Mission sur plusieurs jours
-    // Premier jour
     if (currentDate === startDate) {
-        if (startMin !== null && WORK_END > startMin) {
-            return WORK_END - startMin;
-        }
+        if (startMin !== null && WORK_END > startMin) return WORK_END - startMin;
         return 8 * 60;
     }
-    
-    // Dernier jour
+
     if (currentDate === endDate) {
-        if (endMin !== null && endMin > WORK_START) {
-            return endMin - WORK_START;
-        }
+        if (endMin !== null && endMin > WORK_START) return endMin - WORK_START;
         return 8 * 60;
     }
-    
-    // Jour complet en mission
-    return 8 * 60; // 8 heures
+
+    return 8 * 60;
 }
-// Build map: "employeHrId__date" => [requests]
+
 function buildApprovedRequestMap(requestRows, startDateStr, endDateStr) {
     const map = new Map();
 
@@ -300,8 +295,7 @@ async function fetchSpecialDays(startDate, endDate) {
     }
 }
 
-// Core day computation
-function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDaysForDate = []) {
+function computeDayResult(attendanceRow, requestsForDay, currentDate) {
     const arrival = attendanceRow?.arrival_time ? formatTimeHHMM(attendanceRow.arrival_time) : null;
     const departure = attendanceRow?.departure_time ? formatTimeHHMM(attendanceRow.departure_time) : null;
     const hasAttendance = !!(arrival || departure);
@@ -346,8 +340,9 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
 
     const conge = conges[0] || null;
 
-    // ⭐ Priorité: Congé (si pas de pointage)
-    if (conge && !hasAttendance) {
+    // ✅ FIX 3: Half-day congé always shows regardless of attendance
+    // (employee badges in for the other half, so hasAttendance=true — we must not skip it)
+    if (conge) {
         if (conge.demi_journee) {
             return {
                 workedMinutes: 240,
@@ -363,22 +358,21 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
                 isGlobalPaidLeave: false,
             };
         }
-        return {
-            workedMinutes: 0,
-            displayText: 'Conge',
-            isLate: false,
-            lateMinutes: 0,
-            lateJustified: false,
-            status: 'conge',
-            arrival: null,
-            departure: null,
-            congeDays: 1,
-            isHoliday: false,
-            isGlobalPaidLeave: false,
-        };
+        // Full-day congé: only show if no attendance record
+        if (!hasAttendance) {
+            return {
+                workedMinutes: 0,
+                displayText: 'Congé',
+                isLate: false,
+                lateMinutes: 0,
+                lateJustified: false,
+                status: 'conge',
+                arrival: null,
+                departure: null,
+            };
+        }
     }
 
-    // ⭐ Priorité: Mission complète (sans pointage)
     const hasMission = missions.length > 0;
     if (hasMission && !hasAttendance) {
         const totalMissionMins = missions.reduce((s, r) => s + getMissionDayMinutes(r, currentDate), 0);
@@ -397,33 +391,27 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
         };
     }
 
-    // ⭐ Journée normale avec pointage
     const workedRaw = computeWorkedMinutes(arrival, departure, 60);
     const totalAuthMins = autorisations.reduce((s, r) => s + getAuthorizationMinutes(r), 0);
-    const totalMissionMins = missions.reduce((s, r) => s + getMissionDayMinutes(r, currentDate), 0);
-    
+
     const lateJustified = isLateJustified(arrival, requestsForDay);
     const late = arrival ? isLate(arrival) && !lateJustified : false;
     const lateMinutes = late ? getLateMinutes(arrival) : 0;
 
     if (workedRaw !== null) {
+        // ✅ FIX 2: Autorisations ADD to worked time (not subtract)
+        // The employee was absent for those hours — worked time already excludes them.
+        // Adding back the autorisation minutes compensates for the approved absence.
         let finalMinutes = workedRaw;
         let detail = `${arrival} → ${departure}`;
         const notes = [];
 
         if (totalAuthMins > 0) {
-            finalMinutes = Math.max(0, finalMinutes - totalAuthMins);
-            notes.push(`-${formatMinutesToHours(totalAuthMins)} autorisation`);
+            finalMinutes = workedRaw + totalAuthMins;
+            notes.push(`autorisation ${formatMinutesToHours(totalAuthMins)}`);
         }
 
-        if (totalMissionMins > 0 && !hasAttendance) {
-            // Ne pas ajouter mission si l'employé a pointé (sauf si mission partielle)
-            // Pour l'instant, on ignore la mission si pointage présent
-        }
-
-        if (notes.length) {
-            detail += ` (${notes.join(', ')})`;
-        }
+        if (notes.length) detail += ` (${notes.join(', ')})`;
 
         return {
             workedMinutes: finalMinutes,
@@ -456,6 +444,7 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
         };
     }
 
+    // No attendance, no requests
     return {
         workedMinutes: 0,
         displayText: '—',
@@ -465,15 +454,76 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
         status: 'absent',
         arrival: null,
         departure: null,
-        congeDays: 0,
-        isHoliday: false,
-        isGlobalPaidLeave: false,
     };
+}
+
+// ══════════════════════════════════════════════════════════════
+// ACTIVE EMPLOYEE SOURCE OF TRUTH
+// ══════════════════════════════════════════════════════════════
+
+async function fetchActiveHrEmployees() {
+    if (!global.hrPool) {
+        throw new Error('global.hrPool is required to filter active employees');
+    }
+
+    const { rows } = await global.hrPool.query(`
+        SELECT id, matricule, nom, prenom
+        FROM employees
+        WHERE date_depart IS NULL
+          AND COALESCE(statut, 'actif') = 'actif'
+        ORDER BY nom, prenom
+    `);
+
+    return rows;
+}
+
+async function fetchActiveReportEmployees() {
+    const activeHrEmployees = await fetchActiveHrEmployees();
+    const matricules = activeHrEmployees
+        .map(e => normalizeMatricule(e.matricule))
+        .filter(Boolean);
+
+    if (!matricules.length) return [];
+
+    const { rows: attendanceEmployees } = await global.attendancePool.query(`
+        SELECT uid, matricule, pointeuse_user_id, full_name, card_no, updated_at
+        FROM public.employees
+        WHERE matricule = ANY($1::text[])
+    `, [matricules]);
+
+    const attendanceByMatricule = new Map();
+    attendanceEmployees.forEach(row => {
+        const key = normalizeMatricule(row.matricule);
+        if (key) attendanceByMatricule.set(key, row);
+    });
+
+    return activeHrEmployees.map(hrEmp => {
+        const matricule = normalizeMatricule(hrEmp.matricule);
+        const attEmp = attendanceByMatricule.get(matricule) || null;
+        const hrName = `${hrEmp.prenom || ''} ${hrEmp.nom || ''}`.trim();
+
+        return {
+            hrId: hrEmp.id,
+            uid: attEmp?.uid ?? null,
+            matricule: hrEmp.matricule,
+            name: attEmp?.full_name || hrName,
+            cardNo: attEmp?.card_no || null,
+            pointeuseUserId: attEmp?.pointeuse_user_id || null,
+            updatedAt: attEmp?.updated_at || null,
+        };
+    });
+}
+
+function getActiveUids(employees) {
+    return employees
+        .filter(e => e.uid !== null && e.uid !== undefined)
+        .map(e => e.uid);
 }
 
 // ══════════════════════════════════════════════════════════════
 // FETCH HR APPROVED REQUESTS
 // ══════════════════════════════════════════════════════════════
+
 async function fetchApprovedRequests(startDate, endDate) {
     if (!global.hrPool) return [];
 
@@ -496,51 +546,19 @@ async function fetchApprovedRequests(startDate, endDate) {
     }
 }
 
-// Fetch mapping: attendance uid → HR employee id (via matricule)
-async function fetchUidToHrIdMap(uids) {
-    if (!global.hrPool || !global.attendancePool || !uids.length) return new Map();
-
-    try {
-        const attResult = await global.attendancePool.query(
-            `SELECT uid, matricule FROM employees WHERE uid = ANY($1::int[])`,
-            [uids]
-        );
-
-        if (!attResult.rows.length) return new Map();
-
-        const matricules = attResult.rows.map(r => r.matricule).filter(Boolean);
-        if (!matricules.length) return new Map();
-
-        const hrResult = await global.hrPool.query(
-            `SELECT id, matricule FROM employees WHERE matricule = ANY($1::text[])`,
-            [matricules]
-        );
-
-        const matriculeToHrId = new Map();
-        hrResult.rows.forEach(r => matriculeToHrId.set(String(r.matricule).trim(), r.id));
-
-        const map = new Map();
-        attResult.rows.forEach(r => {
-            const hrId = matriculeToHrId.get(String(r.matricule).trim());
-            if (hrId) {
-                map.set(r.uid, hrId);
-            } else {
-                console.warn(`⚠️ No HR employee match for attendance uid=${r.uid}, matricule=${r.matricule}`);
-            }
-        });
-
-        return map;
-    } catch (e) {
-        console.warn('⚠️ Could not build uid→hrId map:', e.message);
-        return new Map();
-    }
-}
-
 // ══════════════════════════════════════════════════════════════
 // GET /api/attendance
 // ══════════════════════════════════════════════════════════════
+
 router.get('/attendance', async (req, res) => {
     try {
+        const employees = await fetchActiveReportEmployees();
+        const activeUids = getActiveUids(employees);
+
+        if (!activeUids.length) {
+            return res.json({ success: true, count: 0, data: [], fetchedAt: new Date().toISOString() });
+        }
+
         const { rows } = await global.attendancePool.query(`
             SELECT
                 d.uid,
@@ -557,8 +575,9 @@ router.get('/attendance', async (req, res) => {
                 d.entries,
                 d.last_update        AS "lastUpdate"
             FROM public.attendance_daily d
+            WHERE d.uid = ANY($1::int[])
             ORDER BY d.work_date DESC, d.full_name ASC
-        `);
+        `, [activeUids]);
 
         res.json({
             success: true,
@@ -576,21 +595,21 @@ router.get('/attendance', async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // GET /api/employees
 // ══════════════════════════════════════════════════════════════
+
 router.get('/employees', async (req, res) => {
     try {
-        const { rows } = await global.attendancePool.query(`
-            SELECT
-                uid,
-                matricule,
-                pointeuse_user_id AS "pointeuseUserId",
-                full_name         AS name,
-                card_no           AS "cardNo",
-                updated_at        AS "updatedAt"
-            FROM public.employees
-            ORDER BY full_name ASC
-        `);
+        const activeEmployees = await fetchActiveReportEmployees();
 
-        res.json({ success: true, count: rows.length, employees: rows });
+        const employees = activeEmployees.map(emp => ({
+            uid: emp.uid,
+            matricule: emp.matricule,
+            pointeuseUserId: emp.pointeuseUserId,
+            name: emp.name,
+            cardNo: emp.cardNo,
+            updatedAt: emp.updatedAt,
+        }));
+
+        res.json({ success: true, count: employees.length, employees });
     } catch (error) {
         console.error('❌ GET /employees error:', error.message);
         res.status(500).json({ success: false, error: error.message });
@@ -600,77 +619,33 @@ router.get('/employees', async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // GET /api/summary
 // ══════════════════════════════════════════════════════════════
-router.get('/special-days', async (req, res) => {
-    try {
-        const today = formatLocalDate(new Date());
-        const start = req.query.start || today;
-        const end = req.query.end || start;
-        const data = await fetchSpecialDays(start, end);
-
-        res.json({ success: true, days: data.rows });
-    } catch (error) {
-        console.error('GET /special-days error:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.post('/special-days', async (req, res) => {
-    try {
-        const { date, type, label } = req.body || {};
-        if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
-            return res.status(400).json({ success: false, error: 'date must be YYYY-MM-DD' });
-        }
-        if (!['jour_ferie', 'conge_paye_global'].includes(type)) {
-            return res.status(400).json({ success: false, error: 'type must be jour_ferie or conge_paye_global' });
-        }
-
-        await ensureSpecialDaysTable();
-        const { rows } = await global.attendancePool.query(`
-            INSERT INTO public.attendance_special_days (day_date, type, label)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (day_date, type)
-            DO UPDATE SET label = EXCLUDED.label
-            RETURNING id, day_date::text AS date, type, label
-        `, [date, type, label || null]);
-
-        res.json({ success: true, day: rows[0] });
-    } catch (error) {
-        console.error('POST /special-days error:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-router.delete('/special-days/:id', async (req, res) => {
-    try {
-        await ensureSpecialDaysTable();
-        const { rowCount } = await global.attendancePool.query(
-            `DELETE FROM public.attendance_special_days WHERE id = $1`,
-            [req.params.id]
-        );
-
-        res.json({ success: true, deleted: rowCount });
-    } catch (error) {
-        console.error('DELETE /special-days error:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
 
 router.get('/summary', async (req, res) => {
     try {
         const today = formatLocalDate(new Date());
+        const employees = await fetchActiveReportEmployees();
+        const activeUids = getActiveUids(employees);
 
-        const [totalEmployees, todayStats, totalRecords, lastSync] = await Promise.all([
-            global.attendancePool.query(`SELECT COUNT(*) AS count FROM public.employees`),
-            global.attendancePool.query(`
-                SELECT
-                    COUNT(*) FILTER (WHERE status != 'Absent') AS present,
-                    COUNT(*) FILTER (WHERE status = 'En retard') AS late,
-                    COUNT(*) FILTER (WHERE status = 'En cours') AS in_progress,
-                    COUNT(*) FILTER (WHERE status = 'Absent') AS absent
-                FROM public.attendance_daily
-                WHERE work_date = $1
-            `, [today]),
-            global.attendancePool.query(`SELECT COUNT(*) AS count FROM public.attendance_daily`),
+        const [todayStats, totalRecords, lastSync] = await Promise.all([
+            activeUids.length
+                ? global.attendancePool.query(`
+                    SELECT
+                        COUNT(*) FILTER (WHERE status != 'Absent') AS present,
+                        COUNT(*) FILTER (WHERE status = 'En retard') AS late,
+                        COUNT(*) FILTER (WHERE status = 'En cours') AS in_progress,
+                        COUNT(*) FILTER (WHERE status = 'Absent') AS absent
+                    FROM public.attendance_daily
+                    WHERE work_date = $1
+                      AND uid = ANY($2::int[])
+                `, [today, activeUids])
+                : { rows: [{ present: 0, late: 0, in_progress: 0, absent: 0 }] },
+            activeUids.length
+                ? global.attendancePool.query(`
+                    SELECT COUNT(*) AS count
+                    FROM public.attendance_daily
+                    WHERE uid = ANY($1::int[])
+                `, [activeUids])
+                : { rows: [{ count: 0 }] },
             global.attendancePool.query(`
                 SELECT started_at, finished_at, success, message
                 FROM public.sync_runs
@@ -683,7 +658,7 @@ router.get('/summary', async (req, res) => {
         res.json({
             success: true,
             summary: {
-                totalEmployees: parseInt(totalEmployees.rows[0].count, 10),
+                totalEmployees: employees.length,
                 totalRecords: parseInt(totalRecords.rows[0].count, 10),
                 today: {
                     date: today,
@@ -710,6 +685,7 @@ router.get('/summary', async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // GET /api/sync/history
 // ══════════════════════════════════════════════════════════════
+
 router.get('/sync/history', async (req, res) => {
     try {
         const { rows } = await global.attendancePool.query(`
@@ -727,9 +703,11 @@ router.get('/sync/history', async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // GET /api/health
 // ══════════════════════════════════════════════════════════════
+
 router.get('/health', async (req, res) => {
     try {
         await global.attendancePool.query('SELECT 1');
+        if (global.hrPool) await global.hrPool.query('SELECT 1');
         res.json({
             success: true,
             status: 'healthy',
@@ -744,11 +722,11 @@ router.get('/health', async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // GET /api/report?start=YYYY-MM-DD&end=YYYY-MM-DD
 // ══════════════════════════════════════════════════════════════
+
 router.get('/report', async (req, res) => {
     try {
         let { start, end } = req.query;
 
-        // Default: current week Mon→today
         if (!start || !end) {
             const today = new Date();
             const day = today.getDay();
@@ -764,25 +742,21 @@ router.get('/report', async (req, res) => {
             return res.json({ success: true, start, end, weekDays: [], employees: [], summary: {} });
         }
 
-        // 1. Fetch all employees from attendance DB
-        const employeesResult = await global.attendancePool.query(`
-            SELECT uid, matricule, full_name AS name, card_no AS "cardNo"
-            FROM public.employees
-            ORDER BY full_name ASC
-        `);
-        const employees = employeesResult.rows;
-        const uids = employees.map(e => e.uid);
+        // 1. Fetch active employees from HR, match to attendance by matricule
+        const employees = await fetchActiveReportEmployees();
+        const activeUids = getActiveUids(employees);
 
-        // 2. Fetch attendance data for the range
-        const attendanceResult = await global.attendancePool.query(`
-            SELECT uid, full_name, work_date, arrival_time, departure_time, status
-            FROM public.attendance_daily
-            WHERE work_date BETWEEN $1 AND $2
-              AND uid = ANY($3::int[])
-            ORDER BY work_date, full_name
-        `, [start, end, uids]);
+        // 2. Fetch attendance data for active employees only
+        const attendanceResult = activeUids.length
+            ? await global.attendancePool.query(`
+                SELECT uid, full_name, work_date, arrival_time, departure_time, status
+                FROM public.attendance_daily
+                WHERE work_date BETWEEN $1 AND $2
+                  AND uid = ANY($3::int[])
+                ORDER BY work_date, full_name
+            `, [start, end, activeUids])
+            : { rows: [] };
 
-        // Build map: "uid__date" => row
         const attendanceMap = new Map();
         attendanceResult.rows.forEach(row => {
             const date = row.work_date instanceof Date
@@ -792,12 +766,8 @@ router.get('/report', async (req, res) => {
             attendanceMap.set(`${row.uid}__${date}`, row);
         });
 
-        // 3. Fetch HR approved requests + build uid→hrId map
-        const [approvedRequests, uidToHrId] = await Promise.all([
-            fetchApprovedRequests(start, end),
-            fetchUidToHrIdMap(uids),
-        ]);
-
+        // 3. Fetch HR approved requests
+        const approvedRequests = await fetchApprovedRequests(start, end);
         const approvedRequestMap = buildApprovedRequestMap(approvedRequests, start, end);
         const specialDays = await fetchSpecialDays(start, end);
 
@@ -811,16 +781,14 @@ router.get('/report', async (req, res) => {
             let empTotalMinutes = 0;
             let empLateCount = 0;
             let empLateMinutes = 0;
-            let empCongeDays = 0;
-            const hrId = uidToHrId.get(emp.uid);
 
             const days = weekDays.map(date => {
-                const attRow = attendanceMap.get(`${emp.uid}__${date}`);
-                const reqKey = hrId ? `${hrId}__${date}` : null;
-                const requestsForDay = reqKey ? (approvedRequestMap.get(reqKey) || []) : [];
-                const specialDaysForDate = specialDays.byDate.get(date) || [];
+                const attRow = emp.uid !== null && emp.uid !== undefined
+                    ? attendanceMap.get(`${emp.uid}__${date}`)
+                    : null;
 
-                const result = computeDayResult(attRow, requestsForDay, date, specialDaysForDate);
+                const requestsForDay = approvedRequestMap.get(`${emp.hrId}__${date}`) || [];
+                const result = computeDayResult(attRow, requestsForDay, date);
 
                 empTotalMinutes += result.workedMinutes;
                 empCongeDays += result.congeDays || 0;
@@ -948,6 +916,7 @@ router.get('/report', async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // GET /api/report/late?start=YYYY-MM-DD&end=YYYY-MM-DD
 // ══════════════════════════════════════════════════════════════
+
 router.get('/report/late', async (req, res) => {
     try {
         let { start, end } = req.query;
@@ -966,27 +935,35 @@ router.get('/report/late', async (req, res) => {
             return res.json({ success: true, start, end, lateArrivals: [], summary: {} });
         }
 
-        // 1. Fetch only attendance rows where arrival is after 08:30
+        const employees = await fetchActiveReportEmployees();
+        const activeUids = getActiveUids(employees);
+
+        if (!activeUids.length) {
+            return res.json({ success: true, start, end, lateArrivals: [], summary: { totalLate: 0 } });
+        }
+
+        const hrIdByUid = new Map();
+        employees.forEach(emp => {
+            if (emp.uid !== null && emp.uid !== undefined) hrIdByUid.set(emp.uid, emp.hrId);
+        });
+
+        // 1. Fetch only active employees with arrival after 08:30
         const { rows: attRows } = await global.attendancePool.query(`
             SELECT uid, full_name, work_date, arrival_time, departure_time
             FROM public.attendance_daily
             WHERE work_date BETWEEN $1 AND $2
+              AND uid = ANY($3::int[])
               AND arrival_time IS NOT NULL
               AND arrival_time > '08:30:00'
             ORDER BY work_date ASC, arrival_time ASC
-        `, [start, end]);
+        `, [start, end, activeUids]);
 
         if (!attRows.length) {
             return res.json({ success: true, start, end, lateArrivals: [], summary: { totalLate: 0 } });
         }
 
-        const uids = [...new Set(attRows.map(r => r.uid))];
-
         // 2. HR corrections
-        const [approvedRequests, uidToHrId] = await Promise.all([
-            fetchApprovedRequests(start, end),
-            fetchUidToHrIdMap(uids),
-        ]);
+        const approvedRequests = await fetchApprovedRequests(start, end);
         const approvedRequestMap = buildApprovedRequestMap(approvedRequests, start, end);
 
         // 3. Filter out justified lates
@@ -997,11 +974,9 @@ router.get('/report/late', async (req, res) => {
                 ? formatLocalDate(row.work_date)
                 : String(row.work_date).split('T')[0];
 
-            const hrId = uidToHrId.get(row.uid);
-            const reqKey = hrId ? `${hrId}__${date}` : null;
-            const requestsForDay = reqKey ? (approvedRequestMap.get(reqKey) || []) : [];
+            const hrId = hrIdByUid.get(row.uid);
+            const requestsForDay = hrId ? (approvedRequestMap.get(`${hrId}__${date}`) || []) : [];
 
-            // Skip if on approved congé and no attendance conflict resolution is desired
             const hasConge = requestsForDay.some(r => normalizeTypeDemande(r.type_demande) === 'conges');
             if (hasConge) continue;
 
