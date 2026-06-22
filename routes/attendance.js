@@ -295,7 +295,7 @@ async function fetchSpecialDays(startDate, endDate) {
     }
 }
 
-function computeDayResult(attendanceRow, requestsForDay, currentDate) {
+function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDaysForDate = []) {
     const arrival = attendanceRow?.arrival_time ? formatTimeHHMM(attendanceRow.arrival_time) : null;
     const departure = attendanceRow?.departure_time ? formatTimeHHMM(attendanceRow.departure_time) : null;
     const hasAttendance = !!(arrival || departure);
@@ -781,6 +781,7 @@ router.get('/report', async (req, res) => {
             let empTotalMinutes = 0;
             let empLateCount = 0;
             let empLateMinutes = 0;
+            let empCongeDays = 0;
 
             const days = weekDays.map(date => {
                 const attRow = emp.uid !== null && emp.uid !== undefined
@@ -788,7 +789,8 @@ router.get('/report', async (req, res) => {
                     : null;
 
                 const requestsForDay = approvedRequestMap.get(`${emp.hrId}__${date}`) || [];
-                const result = computeDayResult(attRow, requestsForDay, date);
+                const specialDaysForDate = specialDays.byDate.get(date) || [];
+                const result = computeDayResult(attRow, requestsForDay, date, specialDaysForDate);
 
                 empTotalMinutes += result.workedMinutes;
                 empCongeDays += result.congeDays || 0;
