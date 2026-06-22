@@ -73,6 +73,39 @@ function isLate(arrivalTime) {
     return mins !== null && mins > LATE_THRESHOLD;
 }
 
+function getWeekKey(dateStr) {
+    const date = parseLocalDate(dateStr);
+    const monday = new Date(date);
+    const day = monday.getDay();
+    monday.setDate(date.getDate() - (day === 0 ? 6 : day - 1));
+    return formatLocalDate(monday);
+}
+
+function groupDatesByWeek(dates) {
+    const weeks = [];
+    const byKey = new Map();
+
+    dates.forEach(date => {
+        const key = getWeekKey(date);
+        if (!byKey.has(key)) {
+            byKey.set(key, {
+                key,
+                start: date,
+                end: date,
+                weekDays: [],
+            });
+            weeks.push(byKey.get(key));
+        }
+
+        const week = byKey.get(key);
+        week.weekDays.push(date);
+        if (date < week.start) week.start = date;
+        if (date > week.end) week.end = date;
+    });
+
+    return weeks;
+}
+
 function getLateMinutes(arrivalTime) {
     const mins = toMinutesFromTime(arrivalTime);
     if (mins === null || mins <= LATE_THRESHOLD) return 0;
@@ -231,11 +264,81 @@ function buildApprovedRequestMap(requestRows, startDateStr, endDateStr) {
     return map;
 }
 
+async function ensureSpecialDaysTable() {
+    await global.attendancePool.query(`
+        CREATE TABLE IF NOT EXISTS public.attendance_special_days (
+            id SERIAL PRIMARY KEY,
+            day_date DATE NOT NULL,
+            type TEXT NOT NULL CHECK (type IN ('jour_ferie', 'conge_paye_global')),
+            label TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE (day_date, type)
+        )
+    `);
+}
+
+async function fetchSpecialDays(startDate, endDate) {
+    try {
+        await ensureSpecialDaysTable();
+        const { rows } = await global.attendancePool.query(`
+            SELECT id, day_date::text AS date, type, label
+            FROM public.attendance_special_days
+            WHERE day_date BETWEEN $1 AND $2
+            ORDER BY day_date ASC, type ASC
+        `, [startDate, endDate]);
+
+        const byDate = new Map();
+        rows.forEach(row => {
+            if (!byDate.has(row.date)) byDate.set(row.date, []);
+            byDate.get(row.date).push(row);
+        });
+
+        return { rows, byDate };
+    } catch (e) {
+        console.warn('Could not fetch special days:', e.message);
+        return { rows: [], byDate: new Map() };
+    }
+}
+
 // Core day computation
-function computeDayResult(attendanceRow, requestsForDay, currentDate) {
+function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDaysForDate = []) {
     const arrival = attendanceRow?.arrival_time ? formatTimeHHMM(attendanceRow.arrival_time) : null;
     const departure = attendanceRow?.departure_time ? formatTimeHHMM(attendanceRow.departure_time) : null;
     const hasAttendance = !!(arrival || departure);
+
+    const holiday = specialDaysForDate.find(d => d.type === 'jour_ferie');
+    if (holiday) {
+        return {
+            workedMinutes: 0,
+            displayText: holiday.label ? `Ferie (${holiday.label})` : 'Jour ferie',
+            isLate: false,
+            lateMinutes: 0,
+            lateJustified: false,
+            status: 'ferie',
+            arrival: null,
+            departure: null,
+            congeDays: 0,
+            isHoliday: true,
+            isGlobalPaidLeave: false,
+        };
+    }
+
+    const globalPaidLeave = specialDaysForDate.find(d => d.type === 'conge_paye_global');
+    if (globalPaidLeave && !hasAttendance) {
+        return {
+            workedMinutes: 0,
+            displayText: globalPaidLeave.label ? `Conge paye (${globalPaidLeave.label})` : 'Conge paye',
+            isLate: false,
+            lateMinutes: 0,
+            lateJustified: false,
+            status: 'conge_global',
+            arrival: null,
+            departure: null,
+            congeDays: 1,
+            isHoliday: false,
+            isGlobalPaidLeave: true,
+        };
+    }
 
     const conges = requestsForDay.filter(r => normalizeTypeDemande(r.type_demande) === 'conges');
     const autorisations = requestsForDay.filter(r => normalizeTypeDemande(r.type_demande) === 'autorisation');
@@ -248,24 +351,30 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate) {
         if (conge.demi_journee) {
             return {
                 workedMinutes: 240,
-                displayText: '4h00 (congé ½J)',
+                displayText: '4h00 (conge 1/2J)',
                 isLate: false,
                 lateMinutes: 0,
                 lateJustified: false,
                 status: 'conge_demi',
                 arrival: null,
                 departure: null,
+                congeDays: 0.5,
+                isHoliday: false,
+                isGlobalPaidLeave: false,
             };
         }
         return {
             workedMinutes: 0,
-            displayText: 'Congé',
+            displayText: 'Conge',
             isLate: false,
             lateMinutes: 0,
             lateJustified: false,
             status: 'conge',
             arrival: null,
             departure: null,
+            congeDays: 1,
+            isHoliday: false,
+            isGlobalPaidLeave: false,
         };
     }
 
@@ -282,6 +391,9 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate) {
             status: 'mission',
             arrival: null,
             departure: null,
+            congeDays: 0,
+            isHoliday: false,
+            isGlobalPaidLeave: false,
         };
     }
 
@@ -322,6 +434,9 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate) {
             status: late ? 'late' : 'present',
             arrival,
             departure,
+            congeDays: 0,
+            isHoliday: false,
+            isGlobalPaidLeave: false,
         };
     }
 
@@ -335,6 +450,9 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate) {
             status: 'incomplete',
             arrival,
             departure,
+            congeDays: 0,
+            isHoliday: false,
+            isGlobalPaidLeave: false,
         };
     }
 
@@ -347,6 +465,9 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate) {
         status: 'absent',
         arrival: null,
         departure: null,
+        congeDays: 0,
+        isHoliday: false,
+        isGlobalPaidLeave: false,
     };
 }
 
@@ -479,6 +600,61 @@ router.get('/employees', async (req, res) => {
 // ══════════════════════════════════════════════════════════════
 // GET /api/summary
 // ══════════════════════════════════════════════════════════════
+router.get('/special-days', async (req, res) => {
+    try {
+        const today = formatLocalDate(new Date());
+        const start = req.query.start || today;
+        const end = req.query.end || start;
+        const data = await fetchSpecialDays(start, end);
+
+        res.json({ success: true, days: data.rows });
+    } catch (error) {
+        console.error('GET /special-days error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+router.post('/special-days', async (req, res) => {
+    try {
+        const { date, type, label } = req.body || {};
+        if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+            return res.status(400).json({ success: false, error: 'date must be YYYY-MM-DD' });
+        }
+        if (!['jour_ferie', 'conge_paye_global'].includes(type)) {
+            return res.status(400).json({ success: false, error: 'type must be jour_ferie or conge_paye_global' });
+        }
+
+        await ensureSpecialDaysTable();
+        const { rows } = await global.attendancePool.query(`
+            INSERT INTO public.attendance_special_days (day_date, type, label)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (day_date, type)
+            DO UPDATE SET label = EXCLUDED.label
+            RETURNING id, day_date::text AS date, type, label
+        `, [date, type, label || null]);
+
+        res.json({ success: true, day: rows[0] });
+    } catch (error) {
+        console.error('POST /special-days error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+router.delete('/special-days/:id', async (req, res) => {
+    try {
+        await ensureSpecialDaysTable();
+        const { rowCount } = await global.attendancePool.query(
+            `DELETE FROM public.attendance_special_days WHERE id = $1`,
+            [req.params.id]
+        );
+
+        res.json({ success: true, deleted: rowCount });
+    } catch (error) {
+        console.error('DELETE /special-days error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 router.get('/summary', async (req, res) => {
     try {
         const today = formatLocalDate(new Date());
@@ -623,26 +799,31 @@ router.get('/report', async (req, res) => {
         ]);
 
         const approvedRequestMap = buildApprovedRequestMap(approvedRequests, start, end);
+        const specialDays = await fetchSpecialDays(start, end);
 
         // 4. Build per-employee report
         let totalWorkedMinutes = 0;
         let totalLateCount = 0;
         let totalLateMinutes = 0;
+        let totalCongeDays = 0;
 
         const employeeReports = employees.map(emp => {
             let empTotalMinutes = 0;
             let empLateCount = 0;
             let empLateMinutes = 0;
+            let empCongeDays = 0;
             const hrId = uidToHrId.get(emp.uid);
 
             const days = weekDays.map(date => {
                 const attRow = attendanceMap.get(`${emp.uid}__${date}`);
                 const reqKey = hrId ? `${hrId}__${date}` : null;
                 const requestsForDay = reqKey ? (approvedRequestMap.get(reqKey) || []) : [];
+                const specialDaysForDate = specialDays.byDate.get(date) || [];
 
-                const result = computeDayResult(attRow, requestsForDay, date);
+                const result = computeDayResult(attRow, requestsForDay, date, specialDaysForDate);
 
                 empTotalMinutes += result.workedMinutes;
+                empCongeDays += result.congeDays || 0;
                 if (result.isLate) {
                     empLateCount++;
                     empLateMinutes += result.lateMinutes;
@@ -659,6 +840,7 @@ router.get('/report', async (req, res) => {
             totalWorkedMinutes += empTotalMinutes;
             totalLateCount += empLateCount;
             totalLateMinutes += empLateMinutes;
+            totalCongeDays += empCongeDays;
 
             return {
                 uid: emp.uid,
@@ -669,23 +851,90 @@ router.get('/report', async (req, res) => {
                 totalHours: formatMinutesToHours(empTotalMinutes),
                 lateCount: empLateCount,
                 lateMinutes: empLateMinutes,
+                congeDays: empCongeDays,
                 days,
             };
         });
+
+        const weeks = groupDatesByWeek(weekDays).map((week, index) => {
+            let weekWorkedMinutes = 0;
+            let weekLateCount = 0;
+            let weekLateMinutes = 0;
+            let weekCongeDays = 0;
+
+            const weekEmployees = employeeReports.map(emp => {
+                const days = emp.days.filter(day => week.weekDays.includes(day.date));
+                const totalMinutes = days.reduce((sum, day) => sum + day.workedMinutes, 0);
+                const lateCount = days.filter(day => day.isLate).length;
+                const lateMinutes = days.reduce((sum, day) => sum + (day.lateMinutes || 0), 0);
+                const congeDays = days.reduce((sum, day) => sum + (day.congeDays || 0), 0);
+
+                weekWorkedMinutes += totalMinutes;
+                weekLateCount += lateCount;
+                weekLateMinutes += lateMinutes;
+                weekCongeDays += congeDays;
+
+                return {
+                    uid: emp.uid,
+                    name: emp.name,
+                    cardNo: emp.cardNo,
+                    matricule: emp.matricule,
+                    totalMinutes,
+                    totalHours: formatMinutesToHours(totalMinutes),
+                    lateCount,
+                    lateMinutes,
+                    congeDays,
+                    days,
+                };
+            });
+
+            const holidayDates = week.weekDays.filter(date =>
+                (specialDays.byDate.get(date) || []).some(day => day.type === 'jour_ferie')
+            );
+
+            return {
+                index: index + 1,
+                start: week.start,
+                end: week.end,
+                weekDays: week.weekDays,
+                employees: weekEmployees,
+                summary: {
+                    workingDays: week.weekDays.length,
+                    holidayDays: holidayDates.length,
+                    holidayDates,
+                    totalWorkedMinutes: weekWorkedMinutes,
+                    totalWorkedHours: formatMinutesToHours(weekWorkedMinutes),
+                    totalLateCount: weekLateCount,
+                    totalLateMinutes: weekLateMinutes,
+                    totalCongeDays: weekCongeDays,
+                    employeesWithData: weekEmployees.filter(e => e.totalMinutes > 0 || e.congeDays > 0).length,
+                },
+            };
+        });
+
+        const holidayDates = weekDays.filter(date =>
+            (specialDays.byDate.get(date) || []).some(day => day.type === 'jour_ferie')
+        );
 
         res.json({
             success: true,
             start,
             end,
             weekDays,
+            specialDays: specialDays.rows,
+            weeks,
             employees: employeeReports,
             summary: {
                 totalEmployees: employees.length,
+                workingDays: weekDays.length,
+                holidayDays: holidayDates.length,
+                holidayDates,
                 totalWorkedMinutes,
                 totalWorkedHours: formatMinutesToHours(totalWorkedMinutes),
                 totalLateCount,
                 totalLateMinutes,
-                employeesWithData: employeeReports.filter(e => e.totalMinutes > 0).length,
+                totalCongeDays,
+                employeesWithData: employeeReports.filter(e => e.totalMinutes > 0 || e.congeDays > 0).length,
             },
             generatedAt: new Date().toISOString(),
         });
