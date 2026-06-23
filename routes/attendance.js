@@ -616,6 +616,58 @@ router.get('/employees', async (req, res) => {
     }
 });
 
+router.get('/special-days', async (req, res) => {
+    try {
+        const start = req.query.start || formatLocalDate(new Date());
+        const end = req.query.end || start;
+        const data = await fetchSpecialDays(start, end);
+        res.json({ success: true, days: data.rows });
+    } catch (error) {
+        console.error('❌ GET /special-days error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+router.post('/special-days', async (req, res) => {
+    try {
+        const { date, type, label } = req.body || {};
+        if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+            return res.status(400).json({ success: false, error: 'date must be YYYY-MM-DD' });
+        }
+        if (!['jour_ferie', 'conge_paye_global'].includes(type)) {
+            return res.status(400).json({ success: false, error: 'invalid type' });
+        }
+
+        await ensureSpecialDaysTable();
+        const { rows } = await global.attendancePool.query(`
+            INSERT INTO public.attendance_special_days (day_date, type, label)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (day_date, type)
+            DO UPDATE SET label = EXCLUDED.label
+            RETURNING id, day_date::text AS date, type, label
+        `, [date, type, label || null]);
+
+        res.json({ success: true, day: rows[0] });
+    } catch (error) {
+        console.error('❌ POST /special-days error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+router.delete('/special-days/:id', async (req, res) => {
+    try {
+        await ensureSpecialDaysTable();
+        const { rowCount } = await global.attendancePool.query(
+            'DELETE FROM public.attendance_special_days WHERE id = $1',
+            [req.params.id]
+        );
+        res.json({ success: true, deleted: rowCount });
+    } catch (error) {
+        console.error('❌ DELETE /special-days error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // ══════════════════════════════════════════════════════════════
 // GET /api/summary
 // ══════════════════════════════════════════════════════════════
@@ -776,12 +828,14 @@ router.get('/report', async (req, res) => {
         let totalLateCount = 0;
         let totalLateMinutes = 0;
         let totalCongeDays = 0;
+        let totalHolidayDays = 0;
 
         const employeeReports = employees.map(emp => {
             let empTotalMinutes = 0;
             let empLateCount = 0;
             let empLateMinutes = 0;
             let empCongeDays = 0;
+            let empHolidayDays = 0;
 
             const days = weekDays.map(date => {
                 const attRow = emp.uid !== null && emp.uid !== undefined
@@ -794,6 +848,7 @@ router.get('/report', async (req, res) => {
 
                 empTotalMinutes += result.workedMinutes;
                 empCongeDays += result.congeDays || 0;
+                empHolidayDays += result.status === 'ferie' ? 1 : 0;
                 if (result.isLate) {
                     empLateCount++;
                     empLateMinutes += result.lateMinutes;
@@ -811,6 +866,7 @@ router.get('/report', async (req, res) => {
             totalLateCount += empLateCount;
             totalLateMinutes += empLateMinutes;
             totalCongeDays += empCongeDays;
+            totalHolidayDays += empHolidayDays;
 
             return {
                 uid: emp.uid,
@@ -822,6 +878,7 @@ router.get('/report', async (req, res) => {
                 lateCount: empLateCount,
                 lateMinutes: empLateMinutes,
                 congeDays: empCongeDays,
+                holidayDays: empHolidayDays,
                 days,
             };
         });
@@ -831,6 +888,7 @@ router.get('/report', async (req, res) => {
             let weekLateCount = 0;
             let weekLateMinutes = 0;
             let weekCongeDays = 0;
+            let weekHolidayDays = 0;
 
             const weekEmployees = employeeReports.map(emp => {
                 const days = emp.days.filter(day => week.weekDays.includes(day.date));
@@ -838,11 +896,13 @@ router.get('/report', async (req, res) => {
                 const lateCount = days.filter(day => day.isLate).length;
                 const lateMinutes = days.reduce((sum, day) => sum + (day.lateMinutes || 0), 0);
                 const congeDays = days.reduce((sum, day) => sum + (day.congeDays || 0), 0);
+                const holidayDays = days.filter(day => day.status === 'ferie').length;
 
                 weekWorkedMinutes += totalMinutes;
                 weekLateCount += lateCount;
                 weekLateMinutes += lateMinutes;
                 weekCongeDays += congeDays;
+                weekHolidayDays += holidayDays;
 
                 return {
                     uid: emp.uid,
@@ -854,6 +914,7 @@ router.get('/report', async (req, res) => {
                     lateCount,
                     lateMinutes,
                     congeDays,
+                    holidayDays,
                     days,
                 };
             });
@@ -877,6 +938,7 @@ router.get('/report', async (req, res) => {
                     totalLateCount: weekLateCount,
                     totalLateMinutes: weekLateMinutes,
                     totalCongeDays: weekCongeDays,
+                    totalHolidayDays: weekHolidayDays,
                     employeesWithData: weekEmployees.filter(e => e.totalMinutes > 0 || e.congeDays > 0).length,
                 },
             };
@@ -904,6 +966,7 @@ router.get('/report', async (req, res) => {
                 totalLateCount,
                 totalLateMinutes,
                 totalCongeDays,
+                totalHolidayDays,
                 employeesWithData: employeeReports.filter(e => e.totalMinutes > 0 || e.congeDays > 0).length,
             },
             generatedAt: new Date().toISOString(),
