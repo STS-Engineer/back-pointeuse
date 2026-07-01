@@ -259,10 +259,14 @@ async function recomputeDailyFromRaw(daysBack = 21) {
 
     for (const r of dailyRecords) {
       const existingRes = await client.query(
-        `SELECT arrival_time, departure_time, hours_worked, status, entries
+        `SELECT arrival_time, departure_time, hours_worked, status, entries, COALESCE(manually_corrected, false) AS manually_corrected
          FROM attendance_daily WHERE uid = $1 AND work_date = $2`,
         [r.uid, r.workDate]
       );
+      if (existingRes.rows.length > 0 && existingRes.rows[0].manually_corrected) {
+        dailySkippedAsWorse++;
+        continue;
+      }
       if (existingRes.rows.length > 0 && !shouldReplaceDaily(existingRes.rows[0], r)) {
         dailySkippedAsWorse++;
         continue;
