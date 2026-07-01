@@ -1,6 +1,11 @@
 const Zkteco = require('zkteco-js');
 const moment = require('moment-timezone');
 
+// ✅ FIX (threshold unification): single constant, confirmed threshold is 08:30.
+// Previously this file used < 8*60 / <= 9*60 bands; report.js used 8*60+30.
+// Now all three files (report.js, sync.js, zkteco-service.js) use the same value.
+const LATE_THRESHOLD_MINUTES = 8 * 60 + 30; // 08:30
+
 class ZktecoService {
     constructor(ip = '41.224.4.231', port = 4370, timeout = 5200, inport = 5000) {
         this.ip = ip;
@@ -12,7 +17,7 @@ class ZktecoService {
         this.users = [];
         this.attendanceLogs = [];
         this.processedData = [];
-        
+
         // Liste réelle des employés avec leurs correspondances
         this.realEmployees = [
             { uid: 1,  name: 'Fethi Chaouachi',           matricule: '1',  pointeuseUserId: '40001' },
@@ -63,21 +68,22 @@ class ZktecoService {
             { uid: 59, name: 'Haythem Debbich',           matricule: '59', pointeuseUserId: '40059' },
             { uid: 60, name: 'Eya Grati',                 matricule: '60', pointeuseUserId: '40060' },
         ];
+
         // Maps pour recherche rapide
         this.matriculeMap = {};
         this.pointeuseUserIdMap = {};
         this.uidMap = {};
-        
+
         this.realEmployees.forEach(emp => {
             this.matriculeMap[emp.matricule] = emp;
             this.pointeuseUserIdMap[emp.pointeuseUserId] = emp;
             this.uidMap[emp.uid] = emp;
         });
-        
+
         // Système de correspondance multi-critères
         this.idMappingStrategies = [
             (logUserId) => {
-                const exactMatch = this.realEmployees.find(emp => 
+                const exactMatch = this.realEmployees.find(emp =>
                     emp.matricule === logUserId ||
                     emp.pointeuseUserId === logUserId ||
                     `400${emp.matricule}` === logUserId ||
@@ -88,7 +94,7 @@ class ZktecoService {
             (logUserId) => {
                 if (logUserId && logUserId.startsWith('400')) {
                     const matricule = logUserId.substring(3);
-                    return this.realEmployees.find(emp => 
+                    return this.realEmployees.find(emp =>
                         emp.matricule === matricule ||
                         emp.matricule === matricule.replace(/^0+/, '')
                     );
@@ -98,7 +104,7 @@ class ZktecoService {
             (logUserId) => {
                 const numId = parseInt(logUserId);
                 if (!isNaN(numId) && numId > 0) {
-                    return this.realEmployees.find(emp => 
+                    return this.realEmployees.find(emp =>
                         emp.uid === numId ||
                         parseInt(emp.matricule) === numId
                     );
@@ -106,19 +112,12 @@ class ZktecoService {
                 return null;
             }
         ];
-        
+
         console.log(`🚀 ZktecoService initialized — device: ${this.ip}:${this.port}`);
     }
 
     extractUserId(log) {
-        const possibleFields = [
-            'enrollNumber',
-            'PIN',
-            'user_id',
-            'userId',
-            'userid',
-            'uid'
-        ];
+        const possibleFields = ['enrollNumber', 'PIN', 'user_id', 'userId', 'userid', 'uid'];
         for (const field of possibleFields) {
             if (log[field] !== undefined && log[field] !== null && log[field] !== '') {
                 return log[field].toString().trim();
@@ -136,6 +135,14 @@ class ZktecoService {
         return null;
     }
 
+    // ✅ FIX (threshold unification): replaces the old hardcoded < 8*60 / <= 9*60 bands.
+    // arrival exactly at 08:30 is "À l'heure" (not late), arrival after 08:30 is "En retard".
+    computeArrivalStatus(arrivalTotalMinutes, isToday, hasDeparture) {
+        if (isToday && !hasDeparture) return 'En cours';
+        if (arrivalTotalMinutes <= LATE_THRESHOLD_MINUTES) return "À l'heure";
+        return 'En retard';
+    }
+
     async initialize() {
         try {
             console.log(`🔌 Connecting to ZKTeco at ${this.ip}:${this.port}...`);
@@ -146,10 +153,8 @@ class ZktecoService {
             return true;
         } catch (error) {
             console.error('❌ Cannot reach ZKTeco device:', error.message);
-            console.error('   Make sure port forwarding is configured on your router');
-            console.error(`   Device: ${this.ip}:${this.port}`);
             this.isConnected = false;
-            throw error; // ← fail honestly, no fake data
+            throw error;
         }
     }
 
@@ -165,7 +170,6 @@ class ZktecoService {
                             (usersResponse.data || []);
             console.log(`👥 Raw users from device: ${rawUsers.length}`);
 
-            // Map users using real employee list
             this.users = this.realEmployees.map(emp => {
                 const deviceUser = rawUsers.find(u => {
                     const userId = u.userId || u.userid || u.user_id || '';
@@ -192,7 +196,6 @@ class ZktecoService {
                            (attendanceResponse.data || attendanceResponse || []);
             console.log(`📝 Raw logs from device: ${rawLogs.length}`);
 
-            // Parse logs
             this.attendanceLogs = rawLogs.map(log => {
                 let logTime;
                 const recordTime = log.record_time || log.timestamp;
@@ -264,7 +267,6 @@ class ZktecoService {
 
         } catch (error) {
             console.error('❌ Error fetching data from ZKTeco:', error.message);
-            // ✅ No mock data — throw the real error
             throw new Error(`ZKTeco unreachable: ${error.message}. Check port forwarding on router (port 4370 → 10.10.205.10).`);
         }
     }
@@ -304,6 +306,7 @@ class ZktecoService {
         });
 
         const logsByUserAndDate = {};
+        const todayStr = moment().tz('Africa/Tunis').format('YYYY-MM-DD');
 
         const sortedLogs = [...this.attendanceLogs].sort((a, b) =>
             a.timestamp.getTime() - b.timestamp.getTime()
@@ -373,16 +376,13 @@ class ZktecoService {
             firstEntry.typeLabel = 'Arrivée';
 
             const arrivalTotalMinutes = firstEntry.hour * 60 + firstEntry.minute;
-            if (arrivalTotalMinutes < 8 * 60) {
-                record.status = "À l'heure";
-            } else if (arrivalTotalMinutes <= 9 * 60) {
-                record.status = 'Présent';
-            } else {
-                record.status = 'En retard';
-            }
+            const isToday = record.date === todayStr;
+            const hasDeparture = record.entries.length > 1;
 
-            // Last punch = departure (if more than one)
-            if (record.entries.length > 1) {
+            // ✅ FIX (threshold unification): use class method with shared constant
+            record.status = this.computeArrivalStatus(arrivalTotalMinutes, isToday, hasDeparture);
+
+            if (hasDeparture) {
                 const lastEntry = record.entries[record.entries.length - 1];
                 record.departureTime = lastEntry.time;
                 lastEntry.type = 1;
@@ -402,11 +402,7 @@ class ZktecoService {
                 if (totalMinutes > 240) totalMinutes -= 60; // lunch break
                 totalMinutes = Math.max(0, totalMinutes);
                 record.hoursWorked = (totalMinutes / 60).toFixed(2);
-
             } else {
-                // Only one punch — still arriving
-                const today = moment().tz('Africa/Tunis').format('YYYY-MM-DD');
-                if (record.date === today) record.status = 'En cours';
                 record.hoursWorked = '0.00';
             }
 
@@ -419,10 +415,7 @@ class ZktecoService {
         });
 
         console.log(`✅ Processing done: ${this.processedData.length} records`);
-
-        // Print daily summary
         this.printDailySummary();
-
         console.log('====================================\n');
     }
 

@@ -1,4 +1,3 @@
-
 const express = require('express');
 const router = express.Router();
 
@@ -69,6 +68,11 @@ function normalizeMatricule(value) {
     return String(value || '').trim();
 }
 
+// ✅ FIX (overpayment bug): compute worked minutes from the raw arrival/departure SPAN only.
+// This is now used ONLY to decide whether the lunch deduction applies (span > 4h),
+// NOT as the actual worked-time total. Actual worked time comes from
+// computePhysicalPresentMinutes() below, which accounts for mid-day gaps
+// (e.g. an "autorisation" where the employee badges out and back in).
 function computeWorkedMinutes(arrivalTime, departureTime, lunchBreakMinutes = 60) {
     const arrival = toMinutesFromTime(arrivalTime);
     const departure = toMinutesFromTime(departureTime);
@@ -78,6 +82,39 @@ function computeWorkedMinutes(arrivalTime, departureTime, lunchBreakMinutes = 60
     return Math.max(0, raw - deduction);
 }
 
+// ✅ NEW: sums ACTUAL physical presence time using every punch as alternating IN/OUT pairs,
+// instead of only the first (arrival) and last (departure) punch.
+//
+// Why this matters: previously, hours worked were computed as simply
+// (departure - arrival), which silently includes any mid-day gap (e.g. an
+// employee badging out for a 2-hour authorized absence and badging back in).
+// That gap was then ALSO added on top via the authorization-minutes bonus,
+// double-counting the absence and overpaying the employee.
+//
+// By pairing punches (1st→2nd = present, 2nd→3rd = absent/gap, 3rd→4th = present, ...),
+// any gap between badge-out and badge-in is automatically excluded from worked time,
+// so adding back approved authorization minutes afterward is now correct instead of
+// double-counted.
+function computePhysicalPresentMinutes(entries) {
+    if (!Array.isArray(entries) || entries.length < 2) return 0;
+
+    const sorted = [...entries]
+        .map(e => ({ ...e, _min: toMinutesFromTime(e.time) }))
+        .filter(e => e._min !== null)
+        .sort((a, b) => a._min - b._min);
+
+    let total = 0;
+    for (let i = 0; i + 1 < sorted.length; i += 2) {
+        const inMin = sorted[i]._min;
+        const outMin = sorted[i + 1]._min;
+        if (outMin > inMin) total += (outMin - inMin);
+    }
+    return total;
+}
+
+// ✅ FIX (threshold unification): single source of truth for "late", confirmed at 08:30.
+// This same constant is now also used in sync.js / zkteco-service.js when writing
+// attendance_daily.status, so the dashboard and the report never disagree again.
 const LATE_THRESHOLD = 8 * 60 + 30;
 
 function isLate(arrivalTime) {
@@ -340,8 +377,13 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
 
     const conge = conges[0] || null;
 
-    // ✅ FIX 3: Half-day congé always shows regardless of attendance
+    // Half-day congé always shows regardless of attendance
     // (employee badges in for the other half, so hasAttendance=true — we must not skip it)
+    //
+    // Full-day congé: CONFIRMED RULE — if the employee has any attendance punch that day,
+    // the congé is overridden and the day is treated as a normal worked day instead.
+    // (i.e. we intentionally fall through to the worked-time logic below when hasAttendance
+    // is true; this is NOT a bug, it's the confirmed business rule.)
     if (conge) {
         if (conge.demi_journee) {
             return {
@@ -371,6 +413,8 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
                 departure: null,
             };
         }
+        // else: fall through — employee badged in despite approved congé,
+        // treat the day as worked (confirmed rule).
     }
 
     const hasMission = missions.length > 0;
@@ -391,7 +435,14 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
         };
     }
 
-    const workedRaw = computeWorkedMinutes(arrival, departure, 60);
+    // ✅ FIX (overpayment bug): worked time is now based on ACTUAL physical presence
+    // (every punch pair), not just first-arrival → last-departure. The lunch deduction
+    // is still applied once, based on whether the overall span exceeds 4h (unchanged rule).
+    const physicalMinutes = computePhysicalPresentMinutes(attendanceRow?.entries);
+    const rawSpan = computeWorkedMinutes(arrival, departure, 0); // span only, no deduction, just to decide lunch
+    const lunchDeduction = (rawSpan !== null && rawSpan > 240) ? 60 : 0;
+    const workedRaw = physicalMinutes > 0 ? Math.max(0, physicalMinutes - lunchDeduction) : null;
+
     const totalAuthMins = autorisations.reduce((s, r) => s + getAuthorizationMinutes(r), 0);
 
     const lateJustified = isLateJustified(arrival, requestsForDay);
@@ -399,9 +450,11 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
     const lateMinutes = late ? getLateMinutes(arrival) : 0;
 
     if (workedRaw !== null) {
-        // ✅ FIX 2: Autorisations ADD to worked time (not subtract)
-        // The employee was absent for those hours — worked time already excludes them.
-        // Adding back the autorisation minutes compensates for the approved absence.
+        // Autorisations ADD to worked time (not subtract).
+        // The employee was absent for those hours, and since workedRaw now already
+        // excludes any mid-day gap (badge-out/badge-in), adding back the approved
+        // authorization minutes correctly compensates for that approved absence
+        // without double-counting it.
         let finalMinutes = workedRaw;
         let detail = `${arrival} → ${departure}`;
         const notes = [];
@@ -801,7 +854,7 @@ router.get('/report', async (req, res) => {
         // 2. Fetch attendance data for active employees only
         const attendanceResult = activeUids.length
             ? await global.attendancePool.query(`
-                SELECT uid, full_name, work_date, arrival_time, departure_time, status
+                SELECT uid, full_name, work_date, arrival_time, departure_time, status, entries
                 FROM public.attendance_daily
                 WHERE work_date BETWEEN $1 AND $2
                   AND uid = ANY($3::int[])
@@ -1012,7 +1065,7 @@ router.get('/report/late', async (req, res) => {
             if (emp.uid !== null && emp.uid !== undefined) hrIdByUid.set(emp.uid, emp.hrId);
         });
 
-        // 1. Fetch only active employees with arrival after 08:30
+        // 1. Fetch only active employees with arrival after 08:30 (unified LATE_THRESHOLD)
         const { rows: attRows } = await global.attendancePool.query(`
             SELECT uid, full_name, work_date, arrival_time, departure_time
             FROM public.attendance_daily

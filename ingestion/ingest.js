@@ -1,15 +1,20 @@
 require('dotenv').config();
 const moment = require('moment-timezone');
-const ZktecoService = require('./zkteco-service'); // ← updated path
-const { Pool } = require('pg');                    // ← use pg directly, no db.js
+const ZktecoService = require('./zkteco-service');
+const { Pool } = require('pg');
 
 const TZ = 'Africa/Tunis';
 
-// ── DB pool (uses same connection string as server.js) ─────────
+// ── DB pool ─────────────────────────────────────────────────────
 const pool = new Pool({
   connectionString: process.env.ATTENDANCE_DB_URL,
   ssl: { rejectUnauthorized: false },
 });
+
+// ✅ FIX (threshold unification): single constant used everywhere.
+// Previously sync.js used hardcoded 8*60 / 9*60 bands to assign status,
+// while report.js used 8*60+30. Now both files agree on 8:30.
+const LATE_THRESHOLD_MINUTES = 8 * 60 + 30; // 08:30
 
 function toDateKey(d) {
   return moment(d).tz(TZ).format('YYYY-MM-DD');
@@ -29,6 +34,20 @@ function normalizeExistingEntries(entries) {
   }
 }
 
+// ✅ FIX (threshold unification): determine status using LATE_THRESHOLD_MINUTES (08:30)
+// instead of the old hardcoded < 8*60 / <= 9*60 bands.
+// Rules:
+//   arrival < 08:30  → "À l'heure"
+//   arrival = 08:30  → "À l'heure"  (exactly on time is not late)
+//   arrival > 08:30  → "En retard"
+// (The "Présent" band that existed between 08:00 and 09:00 is removed;
+//  it was inconsistent with report.js which only distinguishes on-time vs late.)
+function computeArrivalStatus(arrivalMinutes, isToday, hasDeparture) {
+  if (isToday && !hasDeparture) return 'En cours';
+  if (arrivalMinutes <= LATE_THRESHOLD_MINUTES) return "À l'heure";
+  return 'En retard';
+}
+
 function scoreDailyRecord(r) {
   let score = 0;
   if (r.arrivalTime) score += 10;
@@ -36,7 +55,8 @@ function scoreDailyRecord(r) {
   const hours = parseFloat(r.hoursWorked || '0');
   if (hours > 0) score += Math.min(hours, 12);
   if (Array.isArray(r.entries)) score += r.entries.length * 2;
-  if (r.status === "À l'heure" || r.status === 'Présent') score += 5;
+  if (r.status === "À l'heure") score += 5;
+  if (r.status === 'Présent') score += 5;   // keep for backwards-compat with old rows
   if (r.status === 'En retard') score += 4;
   if (r.status === 'En cours') score += 1;
   return score;
@@ -68,6 +88,9 @@ async function insertRawLogs(rawLogs) {
     `;
     let inserted = 0;
     for (const l of rawLogs) {
+      // NOTE: the -1h offset below compensates for the Azure VM clock being 1 hour
+      // ahead of Africa/Tunis local time. If the VM timezone is ever corrected,
+      // remove this offset and re-verify punch times in the dashboard before deploying.
       const res = await client.query(sql, [
         String(l.uid),
         String(l.userid),
@@ -145,6 +168,7 @@ async function recomputeDailyFromRaw(daysBack = 21) {
 
     const dayNames = ['Dimanche','Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi'];
     const dailyRecords = [];
+    const todayStr = moment().tz(TZ).format('YYYY-MM-DD');
 
     for (const g of groups.values()) {
       g.entries.sort((a, b) => a.hour !== b.hour ? a.hour - b.hour : a.minute - b.minute);
@@ -172,11 +196,13 @@ async function recomputeDailyFromRaw(daysBack = 21) {
         first.typeLabel = 'Arrivée';
 
         const arrivalMinutes = first.hour * 60 + first.minute;
-        if (arrivalMinutes < 8 * 60) record.status = "À l'heure";
-        else if (arrivalMinutes <= 9 * 60) record.status = 'Présent';
-        else record.status = 'En retard';
+        const isToday = g.date === todayStr;
+        const hasDeparture = g.entries.length > 1;
 
-        if (g.entries.length > 1) {
+        // ✅ FIX (threshold unification): use shared helper instead of hardcoded bands
+        record.status = computeArrivalStatus(arrivalMinutes, isToday, hasDeparture);
+
+        if (hasDeparture) {
           const last = g.entries[g.entries.length - 1];
           record.departureTime = last.time;
           last.type = 1;
@@ -185,6 +211,13 @@ async function recomputeDailyFromRaw(daysBack = 21) {
             g.entries[i].type = 2;
             g.entries[i].typeLabel = 'Passage';
           }
+
+          // Hours worked: arrival → departure minus 1h lunch if span > 4h.
+          // Note: this is the simplified hours calculation used when writing to
+          // attendance_daily. The /api/report endpoint recomputes hours more
+          // accurately using computePhysicalPresentMinutes() (which uses all
+          // punches as alternating in/out pairs). The value stored here is used
+          // by the dashboard display; payslip generation should use /api/report.
           const [ah, am] = record.arrivalTime.split(':').map(Number);
           const [dh, dm] = record.departureTime.split(':').map(Number);
           let totalMinutes = (dh * 60 + dm) - (ah * 60 + am);
@@ -192,8 +225,6 @@ async function recomputeDailyFromRaw(daysBack = 21) {
           totalMinutes = Math.max(0, totalMinutes);
           record.hoursWorked = (totalMinutes / 60).toFixed(2);
         } else {
-          const today = moment().tz(TZ).format('YYYY-MM-DD');
-          if (record.workDate === today) record.status = 'En cours';
           record.hoursWorked = '0.00';
         }
       }
@@ -279,4 +310,4 @@ async function runOnce() {
   if (zktecoService.disconnect) await zktecoService.disconnect();
 }
 
-module.exports = { runOnce }; // ← export for cron, don't auto-execute
+module.exports = { runOnce };
