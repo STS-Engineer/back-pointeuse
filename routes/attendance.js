@@ -455,27 +455,25 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
     const lateMinutes = late ? getLateMinutes(arrival) : 0;
 
     if (workedRaw !== null) {
-        // Autorisations ADD to worked time (not subtract).
-        // The employee was absent for those hours, and since workedRaw now already
-        // excludes any mid-day gap (badge-out/badge-in), adding back the approved
-        // authorization minutes correctly compensates for that approved absence
-        // without double-counting it.
+        // Approved mission/authorisation time fills missing work time up to a normal
+        // 8h day, but does not inflate an already complete pointage day.
         let finalMinutes = workedRaw;
         let detail = `${arrival} → ${departure}`;
         const notes = [];
+        let correctionMinutes = 0;
 
         if (totalAuthMins > 0) {
-            finalMinutes = workedRaw + totalAuthMins;
+            correctionMinutes += totalAuthMins;
             notes.push(`autorisation ${formatMinutesToHours(totalAuthMins)}`);
         }
 
         if (totalMissionMins > 0) {
-            if (totalMissionMins >= 8 * 60) {
-                finalMinutes = Math.max(finalMinutes, 8 * 60);
-            } else {
-                finalMinutes += totalMissionMins;
-            }
+            correctionMinutes += totalMissionMins;
             notes.push(`mission ${formatMinutesToHours(totalMissionMins)}`);
+        }
+
+        if (correctionMinutes > 0) {
+            finalMinutes = Math.max(workedRaw, Math.min(8 * 60, workedRaw + correctionMinutes));
         }
 
         if (notes.length) detail += ` (${notes.join(', ')})`;
@@ -500,9 +498,10 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
         if (totalAuthMins > 0) notes.push(`autorisation ${formatMinutesToHours(totalAuthMins)}`);
         if (totalMissionMins > 0) notes.push(`mission ${formatMinutesToHours(totalMissionMins)}`);
         const detail = notes.length ? ` (${notes.join(', ')})` : '';
+        const correctedMinutes = totalMissionMins > 0 ? totalMissionMins : 0;
 
         return {
-            workedMinutes: 0,
+            workedMinutes: correctedMinutes,
             displayText: `${arrival || '?'} → ${departure || '?'} (incomplet${detail})`,
             isLate: false,
             lateMinutes: 0,
