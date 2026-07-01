@@ -262,23 +262,25 @@ function getMissionDayMinutes(req, currentDate) {
 
     const WORK_START = 8 * 60 + 30;
     const WORK_END = 17 * 60 + 30;
+    const FULL_DAY_MINUTES = 8 * 60;
+    const capMissionDay = (minutes) => Math.min(FULL_DAY_MINUTES, Math.max(0, minutes || 0));
 
     if (startDate === endDate) {
-        if (startMin !== null && endMin !== null && endMin > startMin) return endMin - startMin;
-        return 8 * 60;
+        if (startMin !== null && endMin !== null && endMin > startMin) return capMissionDay(endMin - startMin);
+        return FULL_DAY_MINUTES;
     }
 
     if (currentDate === startDate) {
-        if (startMin !== null && WORK_END > startMin) return WORK_END - startMin;
-        return 8 * 60;
+        if (startMin !== null && WORK_END > startMin) return capMissionDay(WORK_END - startMin);
+        return FULL_DAY_MINUTES;
     }
 
     if (currentDate === endDate) {
-        if (endMin !== null && endMin > WORK_START) return endMin - WORK_START;
-        return 8 * 60;
+        if (endMin !== null && endMin > WORK_START) return capMissionDay(endMin - WORK_START);
+        return FULL_DAY_MINUTES;
     }
 
-    return 8 * 60;
+    return FULL_DAY_MINUTES;
 }
 
 function buildApprovedRequestMap(requestRows, startDateStr, endDateStr) {
@@ -411,6 +413,9 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
                 status: 'conge',
                 arrival: null,
                 departure: null,
+                congeDays: 1,
+                isHoliday: false,
+                isGlobalPaidLeave: false,
             };
         }
         // else: fall through — employee badged in despite approved congé,
@@ -418,8 +423,8 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
     }
 
     const hasMission = missions.length > 0;
+    const totalMissionMins = Math.min(8 * 60, missions.reduce((s, r) => s + getMissionDayMinutes(r, currentDate), 0));
     if (hasMission && !hasAttendance) {
-        const totalMissionMins = missions.reduce((s, r) => s + getMissionDayMinutes(r, currentDate), 0);
         return {
             workedMinutes: totalMissionMins,
             displayText: totalMissionMins ? `${formatMinutesToHours(totalMissionMins)} (mission)` : 'Mission',
@@ -464,6 +469,15 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
             notes.push(`autorisation ${formatMinutesToHours(totalAuthMins)}`);
         }
 
+        if (totalMissionMins > 0) {
+            if (totalMissionMins >= 8 * 60) {
+                finalMinutes = Math.max(finalMinutes, 8 * 60);
+            } else {
+                finalMinutes += totalMissionMins;
+            }
+            notes.push(`mission ${formatMinutesToHours(totalMissionMins)}`);
+        }
+
         if (notes.length) detail += ` (${notes.join(', ')})`;
 
         return {
@@ -472,7 +486,7 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
             isLate: late,
             lateMinutes,
             lateJustified,
-            status: late ? 'late' : 'present',
+            status: hasMission ? 'mission' : (late ? 'late' : 'present'),
             arrival,
             departure,
             congeDays: 0,
@@ -482,13 +496,18 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
     }
 
     if (arrival || departure) {
+        const notes = [];
+        if (totalAuthMins > 0) notes.push(`autorisation ${formatMinutesToHours(totalAuthMins)}`);
+        if (totalMissionMins > 0) notes.push(`mission ${formatMinutesToHours(totalMissionMins)}`);
+        const detail = notes.length ? ` (${notes.join(', ')})` : '';
+
         return {
             workedMinutes: 0,
-            displayText: `${arrival || '?'} → ${departure || '?'} (incomplet)`,
+            displayText: `${arrival || '?'} → ${departure || '?'} (incomplet${detail})`,
             isLate: false,
             lateMinutes: 0,
             lateJustified: false,
-            status: 'incomplete',
+            status: hasMission ? 'mission' : 'incomplete',
             arrival,
             departure,
             congeDays: 0,
