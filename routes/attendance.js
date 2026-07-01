@@ -644,6 +644,10 @@ router.get('/attendance', async (req, res) => {
                 d.hours_worked::text AS "hoursWorked",
                 d.status,
                 d.entries,
+                COALESCE(d.manually_corrected, false) AS "manuallyCorrected",
+                d.correction_comment AS "correctionComment",
+                d.corrected_at       AS "correctedAt",
+                d.corrected_by       AS "correctedBy",
                 d.last_update        AS "lastUpdate"
             FROM public.attendance_daily d
             WHERE d.uid = ANY($1::int[])
@@ -660,6 +664,164 @@ router.get('/attendance', async (req, res) => {
     } catch (error) {
         console.error('❌ GET /attendance error:', error.message);
         res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+
+// ══════════════════════════════════════════════════════════════
+// POST /api/attendance/correct
+// Manual HR correction for missing arrival/departure punches
+// ══════════════════════════════════════════════════════════════
+
+router.post('/attendance/correct', async (req, res) => {
+    const client = await global.attendancePool.connect();
+    try {
+        const { uid, date, arrivalTime, departureTime, comment, correctedBy } = req.body || {};
+
+        if (!uid) return res.status(400).json({ success: false, error: 'uid is required' });
+        if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+            return res.status(400).json({ success: false, error: 'date must be YYYY-MM-DD' });
+        }
+
+        const isValidTime = (v) => !v || /^\d{2}:\d{2}$/.test(String(v));
+        if (!isValidTime(arrivalTime) || !isValidTime(departureTime)) {
+            return res.status(400).json({ success: false, error: 'arrivalTime and departureTime must be HH:mm' });
+        }
+
+        const empRes = await client.query(`
+            SELECT uid, matricule, pointeuse_user_id, full_name, card_no
+            FROM public.employees
+            WHERE uid = $1
+        `, [uid]);
+
+        if (!empRes.rows.length) {
+            return res.status(404).json({ success: false, error: 'Employee not found in attendance database' });
+        }
+
+        const emp = empRes.rows[0];
+
+        const existingRes = await client.query(`
+            SELECT arrival_time, departure_time, entries
+            FROM public.attendance_daily
+            WHERE uid = $1 AND work_date = $2
+        `, [uid, date]);
+
+        const existing = existingRes.rows[0] || {};
+        const finalArrival = arrivalTime || formatTimeHHMM(existing.arrival_time);
+        const finalDeparture = departureTime || formatTimeHHMM(existing.departure_time);
+
+        if (!finalArrival && !finalDeparture) {
+            return res.status(400).json({ success: false, error: 'At least one time is required' });
+        }
+
+        const entries = [];
+        const [year, month, day] = String(date).split('-').map(Number);
+        const dayName = ['Dimanche','Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi'][new Date(year, month - 1, day).getDay()];
+
+        if (finalArrival) {
+            const [h, m] = finalArrival.split(':').map(Number);
+            entries.push({
+                timestamp: `${date}T${finalArrival}:00+01:00`,
+                time: finalArrival,
+                hour: h,
+                minute: m,
+                originalType: 0,
+                type: 0,
+                typeLabel: 'Arrivée',
+                manual: true
+            });
+        }
+
+        if (finalDeparture) {
+            const [h, m] = finalDeparture.split(':').map(Number);
+            entries.push({
+                timestamp: `${date}T${finalDeparture}:00+01:00`,
+                time: finalDeparture,
+                hour: h,
+                minute: m,
+                originalType: 1,
+                type: 1,
+                typeLabel: 'Départ',
+                manual: true
+            });
+        }
+
+        entries.sort((a, b) => (a.hour * 60 + a.minute) - (b.hour * 60 + b.minute));
+        if (entries[0]) { entries[0].type = 0; entries[0].typeLabel = 'Arrivée'; }
+        if (entries.length > 1) { entries[entries.length - 1].type = 1; entries[entries.length - 1].typeLabel = 'Départ'; }
+
+        let hoursWorked = '0.00';
+        let status = 'Absent';
+
+        if (finalArrival && finalDeparture) {
+            let totalMinutes = toMinutesFromTime(finalDeparture) - toMinutesFromTime(finalArrival);
+            if (totalMinutes > 240) totalMinutes -= 60;
+            totalMinutes = Math.max(0, totalMinutes);
+            hoursWorked = (totalMinutes / 60).toFixed(2);
+            status = isLate(finalArrival) ? 'En retard' : "À l'heure";
+        } else if (finalArrival && !finalDeparture) {
+            status = 'Présent (départ manquant)';
+        } else if (!finalArrival && finalDeparture) {
+            status = 'Arrivée manquante';
+        }
+
+        const { rows } = await client.query(`
+            INSERT INTO public.attendance_daily
+                (uid, user_id, pointeuse_user_id, full_name, card_no, work_date, day_name,
+                 arrival_time, departure_time, hours_worked, status, entries, log_user_id, last_update,
+                 manually_corrected, correction_comment, corrected_at, corrected_by)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),true,$14,now(),$15)
+            ON CONFLICT (uid, work_date) DO UPDATE SET
+                user_id = EXCLUDED.user_id,
+                pointeuse_user_id = EXCLUDED.pointeuse_user_id,
+                full_name = EXCLUDED.full_name,
+                card_no = EXCLUDED.card_no,
+                day_name = EXCLUDED.day_name,
+                arrival_time = EXCLUDED.arrival_time,
+                departure_time = EXCLUDED.departure_time,
+                hours_worked = EXCLUDED.hours_worked,
+                status = EXCLUDED.status,
+                entries = EXCLUDED.entries,
+                log_user_id = EXCLUDED.log_user_id,
+                last_update = now(),
+                manually_corrected = true,
+                correction_comment = EXCLUDED.correction_comment,
+                corrected_at = now(),
+                corrected_by = EXCLUDED.corrected_by
+            RETURNING uid, user_id AS "userId", pointeuse_user_id AS "pointeuseUserId",
+                      full_name AS name, card_no AS "cardNo", work_date::text AS date,
+                      day_name AS "dayName", to_char(arrival_time, 'HH24:MI') AS "arrivalTime",
+                      to_char(departure_time, 'HH24:MI') AS "departureTime",
+                      hours_worked::text AS "hoursWorked", status, entries,
+                      manually_corrected AS "manuallyCorrected",
+                      correction_comment AS "correctionComment",
+                      corrected_at AS "correctedAt",
+                      corrected_by AS "correctedBy",
+                      last_update AS "lastUpdate"
+        `, [
+            emp.uid,
+            String(emp.matricule || ''),
+            emp.pointeuse_user_id ? String(emp.pointeuse_user_id) : null,
+            emp.full_name,
+            emp.card_no,
+            date,
+            dayName,
+            finalArrival,
+            finalDeparture,
+            hoursWorked,
+            status,
+            JSON.stringify(entries),
+            emp.pointeuse_user_id ? String(emp.pointeuse_user_id) : String(emp.uid),
+            comment || null,
+            correctedBy || 'HR'
+        ]);
+
+        res.json({ success: true, record: rows[0] });
+    } catch (error) {
+        console.error('❌ POST /attendance/correct error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        client.release();
     }
 });
 
