@@ -34,6 +34,58 @@ function formatTimeHHMM(value) {
     return String(value).slice(0, 5);
 }
 
+function computeManualCorrection(arrivalTime, departureTime) {
+    const arrival = toMinutesFromTime(arrivalTime);
+    const departure = toMinutesFromTime(departureTime);
+
+    if (arrival === null && departure === null) {
+        return { hoursWorked: '0.00', status: 'Absent', entries: [] };
+    }
+
+    const entries = [];
+
+    if (arrivalTime) {
+        entries.push({
+            time: arrivalTime,
+            hour: Number(arrivalTime.split(':')[0]),
+            minute: Number(arrivalTime.split(':')[1]),
+            type: 0,
+            typeLabel: 'Arrivée',
+            source: 'manual_hr'
+        });
+    }
+
+    if (departureTime) {
+        entries.push({
+            time: departureTime,
+            hour: Number(departureTime.split(':')[0]),
+            minute: Number(departureTime.split(':')[1]),
+            type: 1,
+            typeLabel: 'Départ',
+            source: 'manual_hr'
+        });
+    }
+
+    if (arrival === null || departure === null || departure <= arrival) {
+        return {
+            hoursWorked: '0.00',
+            status: 'Incomplet',
+            entries
+        };
+    }
+
+    let totalMinutes = departure - arrival;
+    if (totalMinutes > 240) totalMinutes -= 60;
+    totalMinutes = Math.max(0, totalMinutes);
+
+    const status = arrival <= LATE_THRESHOLD ? "À l'heure" : "En retard";
+
+    return {
+        hoursWorked: (totalMinutes / 60).toFixed(2),
+        status,
+        entries
+    };
+}
 function pad2(n) {
     return String(n).padStart(2, '0');
 }
@@ -1210,7 +1262,128 @@ router.get('/report', async (req, res) => {
         res.status(500).json({ success: false, error: error.message });
     }
 });
+router.post('/attendance/correct', async (req, res) => {
+    try {
+        const {
+            uid,
+            date,
+            arrivalTime,
+            departureTime,
+            comment,
+            correctedBy
+        } = req.body || {};
 
+        if (!uid || !date) {
+            return res.status(400).json({
+                success: false,
+                error: 'uid and date are required'
+            });
+        }
+
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+            return res.status(400).json({
+                success: false,
+                error: 'date must be YYYY-MM-DD'
+            });
+        }
+
+        if (arrivalTime && !/^\d{2}:\d{2}$/.test(String(arrivalTime))) {
+            return res.status(400).json({
+                success: false,
+                error: 'arrivalTime must be HH:MM'
+            });
+        }
+
+        if (departureTime && !/^\d{2}:\d{2}$/.test(String(departureTime))) {
+            return res.status(400).json({
+                success: false,
+                error: 'departureTime must be HH:MM'
+            });
+        }
+
+        const empRes = await global.attendancePool.query(`
+            SELECT uid, matricule, pointeuse_user_id, full_name, card_no
+            FROM public.employees
+            WHERE uid = $1
+            LIMIT 1
+        `, [uid]);
+
+        if (!empRes.rows.length) {
+            return res.status(404).json({
+                success: false,
+                error: 'Employee not found in attendance employees table'
+            });
+        }
+
+        const emp = empRes.rows[0];
+        const result = computeManualCorrection(arrivalTime || null, departureTime || null);
+        const dayName = ['Dimanche','Lundi','Mardi','Mercredi','Jeudi','Vendredi','Samedi'][new Date(date + 'T00:00:00').getDay()];
+
+        const updateRes = await global.attendancePool.query(`
+            INSERT INTO public.attendance_daily
+                (uid, user_id, pointeuse_user_id, full_name, card_no, work_date, day_name,
+                 arrival_time, departure_time, hours_worked, status, entries, log_user_id,
+                 last_update, manually_corrected, correction_comment, corrected_at, corrected_by)
+            VALUES
+                ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+                 now(), true, $14, now(), $15)
+            ON CONFLICT (uid, work_date) DO UPDATE SET
+                arrival_time = EXCLUDED.arrival_time,
+                departure_time = EXCLUDED.departure_time,
+                hours_worked = EXCLUDED.hours_worked,
+                status = EXCLUDED.status,
+                entries = EXCLUDED.entries,
+                last_update = now(),
+                manually_corrected = true,
+                correction_comment = EXCLUDED.correction_comment,
+                corrected_at = now(),
+                corrected_by = EXCLUDED.corrected_by
+            RETURNING
+                uid,
+                user_id AS "userId",
+                pointeuse_user_id AS "pointeuseUserId",
+                full_name AS name,
+                card_no AS "cardNo",
+                work_date::text AS date,
+                day_name AS "dayName",
+                to_char(arrival_time, 'HH24:MI') AS "arrivalTime",
+                to_char(departure_time, 'HH24:MI') AS "departureTime",
+                hours_worked::text AS "hoursWorked",
+                status,
+                entries,
+                manually_corrected AS "manuallyCorrected",
+                correction_comment AS "correctionComment",
+                corrected_at AS "correctedAt",
+                corrected_by AS "correctedBy"
+        `, [
+            emp.uid,
+            emp.matricule,
+            emp.pointeuse_user_id,
+            emp.full_name,
+            emp.card_no,
+            date,
+            dayName,
+            arrivalTime || null,
+            departureTime || null,
+            result.hoursWorked,
+            result.status,
+            JSON.stringify(result.entries),
+            emp.pointeuse_user_id,
+            comment || null,
+            correctedBy || 'HR'
+        ]);
+
+        res.json({
+            success: true,
+            message: 'Attendance corrected successfully',
+            record: updateRes.rows[0]
+        });
+
+    } catch (error) {
+        console.error('❌ POST /attendance/correct error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
 // ══════════════════════════════════════════════════════════════
 // GET /api/report/late?start=YYYY-MM-DD&end=YYYY-MM-DD
 // ══════════════════════════════════════════════════════════════
