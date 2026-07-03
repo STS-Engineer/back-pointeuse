@@ -77,6 +77,16 @@ function shouldReplaceDaily(existing, incoming) {
   return scoreDailyRecord(incoming) > scoreDailyRecord(oldRecord);
 }
 
+async function ensureManualCorrectionColumns(client) {
+  await client.query(`
+    ALTER TABLE attendance_daily
+      ADD COLUMN IF NOT EXISTS manually_corrected BOOLEAN NOT NULL DEFAULT false,
+      ADD COLUMN IF NOT EXISTS correction_comment TEXT,
+      ADD COLUMN IF NOT EXISTS corrected_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS corrected_by TEXT
+  `);
+}
+
 async function insertRawLogs(rawLogs) {
   const client = await pool.connect();
   try {
@@ -115,6 +125,8 @@ async function insertRawLogs(rawLogs) {
 async function recomputeDailyFromRaw(daysBack = 21) {
   const client = await pool.connect();
   try {
+    await ensureManualCorrectionColumns(client);
+
     const since = new Date();
     since.setDate(since.getDate() - daysBack);
 

@@ -386,6 +386,20 @@ async function fetchSpecialDays(startDate, endDate) {
     }
 }
 
+let manualCorrectionColumnsEnsured = false;
+
+async function ensureManualCorrectionColumns(db = global.attendancePool) {
+    if (manualCorrectionColumnsEnsured) return;
+    await db.query(`
+        ALTER TABLE public.attendance_daily
+            ADD COLUMN IF NOT EXISTS manually_corrected BOOLEAN NOT NULL DEFAULT false,
+            ADD COLUMN IF NOT EXISTS correction_comment TEXT,
+            ADD COLUMN IF NOT EXISTS corrected_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS corrected_by TEXT
+    `);
+    manualCorrectionColumnsEnsured = true;
+}
+
 function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDaysForDate = []) {
     const arrival = attendanceRow?.arrival_time ? formatTimeHHMM(attendanceRow.arrival_time) : null;
     const departure = attendanceRow?.departure_time ? formatTimeHHMM(attendanceRow.departure_time) : null;
@@ -675,6 +689,7 @@ async function fetchApprovedRequests(startDate, endDate) {
 
 router.get('/attendance', async (req, res) => {
     try {
+        await ensureManualCorrectionColumns();
         const employees = await fetchActiveReportEmployees();
         const activeUids = getActiveUids(employees);
 
@@ -728,6 +743,7 @@ router.get('/attendance', async (req, res) => {
 router.post('/attendance/correct', async (req, res) => {
     const client = await global.attendancePool.connect();
     try {
+        await ensureManualCorrectionColumns(client);
         const { uid, date, arrivalTime, departureTime, comment, correctedBy } = req.body || {};
 
         if (!uid) return res.status(400).json({ success: false, error: 'uid is required' });
