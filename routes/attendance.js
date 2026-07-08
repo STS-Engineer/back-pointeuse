@@ -1522,3 +1522,18 @@ router.get('/report/late', async (req, res) => {
 });
 
 module.exports = router;
+
+// ── Additional named exports (additive; existing `module.exports = router`
+// usage in server.js as an Express router is unaffected by attaching
+// these helper functions as properties on it) ──────────────────────────
+// Reused by services/missingPoints.js so the missing-point detection logic
+// stays identical to what /api/report already computes.
+module.exports.formatLocalDate = formatLocalDate;
+module.exports.enumerateWeekdays = enumerateWeekdays;
+module.exports.fetchActiveReportEmployees = fetchActiveReportEmployees;
+module.exports.fetchApprovedRequests = fetchApprovedRequests;
+module.exports.buildApprovedRequestMap = buildApprovedRequestMap;
+module.exports.fetchSpecialDays = fetchSpecialDays;
+module.exports.computeDayResult = computeDayResult;
+module.exports.normalizeMatricule = normalizeMatricule;
+module.exports.formatTimeHHMM = formatTimeHHMM;

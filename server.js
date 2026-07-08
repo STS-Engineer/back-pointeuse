@@ -50,6 +50,9 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 const attendanceRoutes = require('./routes/attendance');
 app.use('/api', attendanceRoutes);
 
+const missingPointsRoutes = require('./routes/missingPoints');
+app.use(missingPointsRoutes);
+
 // ── Health check ───────────────────────────────────────────────
 app.get('/health', (req, res) => {
     res.json({
@@ -105,6 +108,22 @@ const server = app.listen(PORT, () => {
     });
 
     console.log('⏰ Ingestion cron job scheduled — runs every hour');
+
+    // ── Missing attendance-point reminder cron (daily, Mon-Fri 07:00 Tunis time) ──
+    const { runDailySweep } = require('./services/missingPoints');
+    const missingPointsCronExpr = process.env.MISSING_POINTS_CRON || '0 7 * * 1-5';
+    cron.schedule(missingPointsCronExpr, async () => {
+        console.log(`\n⏰ [CRON] Starting missing-points sweep at ${new Date().toISOString()}`);
+        try {
+            const result = await runDailySweep();
+            console.log(`✅ [CRON] Missing-points sweep completed: ${JSON.stringify(result)}`);
+        } catch (err) {
+            console.error('❌ [CRON] Missing-points sweep failed:', err.message);
+            // ← never crashes the server, just logs the error
+        }
+    }, { timezone: 'Africa/Tunis' });
+
+    console.log(`⏰ Missing-points sweep cron job scheduled — "${missingPointsCronExpr}" (Africa/Tunis)`);
 });
 
 // ── Graceful shutdown ──────────────────────────────────────────
