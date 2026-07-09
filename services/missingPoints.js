@@ -260,7 +260,7 @@ async function sendEmployeeRequestEmail(row) {
 
     await sendMail({
         to: resolveRecipient(row.employee_email),
-        cc: withAuditCc(resolveRecipient(row.responsable1_email)),
+        cc: withAuditCc(),
         subject: `Pointage manquant le ${row.work_date} — action requise`,
         html: `
             <p>Bonjour ${row.full_name || ''},</p>
