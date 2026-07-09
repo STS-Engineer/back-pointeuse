@@ -16,9 +16,12 @@ const { applyManualCorrection } = require('./attendanceCorrection');
 const TIMEZONE = 'Africa/Tunis';
 const TOKEN_TTL_DAYS = 14;
 const FETHI_NOTIFICATION_EMAIL = process.env.FETHI_NOTIFICATION_EMAIL || 'fethi.chaouachi@avocarbon.com';
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'http://localhost:3000').replace(/\/+$/, '');
+// Hardcoded production defaults — there's no Azure Portal access to set these
+// as App Settings, so the app must work correctly with zero environment
+// configuration. Both can still be overridden via env var if ever needed.
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://pointeuse-back.azurewebsites.net').replace(/\/+$/, '');
 const TEST_OVERRIDE_EMAIL = (process.env.MISSING_POINTS_TEST_OVERRIDE_EMAIL || '').trim() || null;
-const AUDIT_CC_EMAIL = (process.env.MISSING_POINTS_AUDIT_CC || '').trim() || null;
+const AUDIT_CC_EMAIL = (process.env.MISSING_POINTS_AUDIT_CC || 'rami.mejri@avocarbon.com').trim() || null;
 
 // ══════════════════════════════════════════════════════════════
 // TABLE BOOTSTRAP (additive; mirrors ensureManualCorrectionColumns
