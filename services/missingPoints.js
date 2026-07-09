@@ -23,6 +23,16 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://pointeuse-back.
 const TEST_OVERRIDE_EMAIL = (process.env.MISSING_POINTS_TEST_OVERRIDE_EMAIL || '').trim() || null;
 const AUDIT_CC_EMAIL = (process.env.MISSING_POINTS_AUDIT_CC || 'rami.mejri@avocarbon.com').trim() || null;
 
+// Uids never included in missing-point detection — e.g. Fethi (uid 1) doesn't
+// badge in/out through the normal process, so his irregular attendance
+// shouldn't be treated as a correctable "missing point".
+const EXCLUDED_UIDS = new Set(
+    (process.env.MISSING_POINTS_EXCLUDED_UIDS || '1')
+        .split(',')
+        .map(s => parseInt(s.trim(), 10))
+        .filter(n => Number.isFinite(n))
+);
+
 // ══════════════════════════════════════════════════════════════
 // TABLE BOOTSTRAP (additive; mirrors ensureManualCorrectionColumns
 // / ensureSpecialDaysTable pattern already used in routes/attendance.js)
@@ -222,6 +232,7 @@ async function findMissingPointsForDate(dateStr) {
     const missing = [];
     for (const emp of employees) {
         if (emp.uid === null || emp.uid === undefined) continue;
+        if (EXCLUDED_UIDS.has(emp.uid)) continue;
         const attRow = attendanceByUid.get(emp.uid) || null;
         const requestsForDay = approvedRequestMap.get(`${emp.hrId}__${dateStr}`) || [];
         const result = computeDayResult(attRow, requestsForDay, dateStr, specialDaysForDate);
