@@ -484,6 +484,34 @@ async function runDailySweep({ targetDate, dryRun = false } = {}) {
 }
 
 /**
+ * Forces an immediate resend for one specific employee's open request,
+ * bypassing the "already notified today" guard — for cases like an email
+ * that went out with a broken link/wrong recipients before a fix shipped.
+ * Only touches the given uid's own open request; never affects anyone else.
+ */
+async function forceResendForUid(uid) {
+    await ensureMissingPointRequestsTable();
+
+    const { rows } = await global.attendancePool.query(`
+        SELECT * FROM public.missing_point_requests
+        WHERE uid = $1 AND is_test = false
+          AND (status IN ('pending_employee', 'pending_responsable1')
+               OR (status = 'approved' AND fethi_notified_at IS NULL))
+    `, [uid]);
+
+    const row = rows[0];
+    if (!row) return { ok: false, error: 'no_open_request_for_uid' };
+
+    if (row.status === 'pending_employee') {
+        return { ok: true, ...(await resendEmployeeReminder(row, { dryRun: false })) };
+    }
+    if (row.status === 'pending_responsable1') {
+        return { ok: true, ...(await resendResponsableReminder(row, { dryRun: false })) };
+    }
+    return { ok: true, ...(await resendFethiNotificationIfNeeded(row, { dryRun: false })) };
+}
+
+/**
  * Creates a fully synthetic request (fake employee, reserved uid, never
  * touching real HR/attendance data) so the whole loop — employee email,
  * correction form, responsable review, approve/reject, Fethi notification —
@@ -645,6 +673,7 @@ async function rejectRequest(token, rejectionComment) {
 module.exports = {
     ensureMissingPointRequestsTable,
     runDailySweep,
+    forceResendForUid,
     createSyntheticTestRequest,
     isAutomationPaused,
     setAutomationPaused,

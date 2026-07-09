@@ -182,6 +182,22 @@ router.post('/api/missing-points/pause', async (req, res) => {
     }
 });
 
+router.post('/api/missing-points/resend', async (req, res) => {
+    try {
+        if (!checkAutomationKey(req, res)) return;
+        const { uid } = req.body || {};
+        if (uid === undefined || uid === null || Number.isNaN(Number(uid))) {
+            return res.status(400).json({ success: false, error: 'uid (numeric) is required' });
+        }
+        const result = await missingPoints.forceResendForUid(Number(uid));
+        if (!result.ok) return res.status(404).json({ success: false, error: result.error });
+        res.json({ success: true, ...result });
+    } catch (error) {
+        console.error('❌ POST /api/missing-points/resend error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 router.post('/api/missing-points/run', async (req, res) => {
     try {
         if (!checkAutomationKey(req, res)) return;
