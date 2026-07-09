@@ -58,18 +58,64 @@ async function ensureMissingPointRequestsTable() {
             responsable_notified_count INTEGER NOT NULL DEFAULT 0,
             fethi_notified_at TIMESTAMPTZ,
             resolved_at TIMESTAMPTZ,
+            is_test BOOLEAN NOT NULL DEFAULT false,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             UNIQUE (uid, work_date)
         )
     `);
     // Additive safety net in case the table was already created by an
-    // earlier version of this file before this column existed.
+    // earlier version of this file before these columns existed.
     await global.attendancePool.query(`
         ALTER TABLE public.missing_point_requests
-            ADD COLUMN IF NOT EXISTS fethi_notified_at TIMESTAMPTZ
+            ADD COLUMN IF NOT EXISTS fethi_notified_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS is_test BOOLEAN NOT NULL DEFAULT false
     `);
     tableEnsured = true;
+}
+
+// Reserved uid for synthetic test requests — real employee uids are always
+// positive, so this can never collide with a real record.
+const TEST_UID = -1;
+
+// ══════════════════════════════════════════════════════════════
+// AUTOMATION PAUSE SWITCH — controllable via curl, no Azure access needed.
+// Starts PAUSED by default so the real daily cron does nothing until
+// explicitly resumed. Only gates real detection/reminders, never the
+// synthetic test-request flow.
+// ══════════════════════════════════════════════════════════════
+
+let automationStateEnsured = false;
+
+async function ensureAutomationStateTable() {
+    if (automationStateEnsured) return;
+    await global.attendancePool.query(`
+        CREATE TABLE IF NOT EXISTS public.missing_point_automation_state (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            paused BOOLEAN NOT NULL DEFAULT true,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CHECK (id = 1)
+        )
+    `);
+    await global.attendancePool.query(`
+        INSERT INTO public.missing_point_automation_state (id, paused) VALUES (1, true)
+        ON CONFLICT (id) DO NOTHING
+    `);
+    automationStateEnsured = true;
+}
+
+async function isAutomationPaused() {
+    await ensureAutomationStateTable();
+    const { rows } = await global.attendancePool.query(`SELECT paused FROM public.missing_point_automation_state WHERE id = 1`);
+    return rows[0] ? rows[0].paused : true;
+}
+
+async function setAutomationPaused(paused) {
+    await ensureAutomationStateTable();
+    await global.attendancePool.query(`
+        UPDATE public.missing_point_automation_state SET paused = $1, updated_at = now() WHERE id = 1
+    `, [!!paused]);
+    return { paused: !!paused };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -249,8 +295,11 @@ async function sendResponsableReviewEmail(row) {
 }
 
 async function sendFethiNotification(row) {
+    // Synthetic test requests must never reach the real Fethi address —
+    // redirect to whichever test email this request was created for.
+    const recipient = row.is_test ? row.employee_email : resolveRecipient(FETHI_NOTIFICATION_EMAIL);
     await sendMail({
-        to: resolveRecipient(FETHI_NOTIFICATION_EMAIL),
+        to: recipient,
         cc: withAuditCc(),
         subject: `Pointage corrigé et validé — ${row.full_name} — ${row.work_date}`,
         html: `
@@ -389,6 +438,10 @@ async function resendFethiNotificationIfNeeded(row, { dryRun }) {
 async function runDailySweep({ targetDate, dryRun = false } = {}) {
     await ensureMissingPointRequestsTable();
 
+    if (await isAutomationPaused()) {
+        return { paused: true, message: 'Automation is paused — no detection or reminders were run.' };
+    }
+
     const dateStr = targetDate || previousBusinessDayInTz();
     const actions = [];
     const skipped = [];
@@ -412,8 +465,9 @@ async function runDailySweep({ targetDate, dryRun = false } = {}) {
 
     const { rows: openRows } = await global.attendancePool.query(`
         SELECT * FROM public.missing_point_requests
-        WHERE status IN ('pending_employee', 'pending_responsable1')
-           OR (status = 'approved' AND fethi_notified_at IS NULL)
+        WHERE is_test = false
+          AND (status IN ('pending_employee', 'pending_responsable1')
+               OR (status = 'approved' AND fethi_notified_at IS NULL))
     `);
 
     for (const row of openRows) {
@@ -427,6 +481,34 @@ async function runDailySweep({ targetDate, dryRun = false } = {}) {
     }
 
     return { date: dateStr, dryRun, found: missing.length, skipped, actions };
+}
+
+/**
+ * Creates a fully synthetic request (fake employee, reserved uid, never
+ * touching real HR/attendance data) so the whole loop — employee email,
+ * correction form, responsable review, approve/reject, Fethi notification —
+ * can be safely tested end-to-end against a single real inbox. Approving a
+ * test request never writes to attendance_daily (see approveRequest below).
+ */
+async function createSyntheticTestRequest(testEmail) {
+    await ensureMissingPointRequestsTable();
+
+    await global.attendancePool.query(`DELETE FROM public.missing_point_requests WHERE is_test = true`);
+
+    const employeeToken = generateToken();
+    const { rows } = await global.attendancePool.query(`
+        INSERT INTO public.missing_point_requests
+            (uid, matricule, full_name, work_date, missing_type, status,
+             employee_email, responsable1_email,
+             employee_token, employee_token_expires_at, is_test)
+        VALUES ($1,'TEST','Test (bac a sable)',$2,'departure','pending_employee',$3,$3,$4,$5,true)
+        RETURNING *
+    `, [TEST_UID, todayInTz(), testEmail, employeeToken, tokenExpiry()]);
+
+    const row = rows[0];
+    await sendEmployeeRequestEmail(row);
+    await markEmployeeNotified(row.id);
+    return { action: 'test_request_created', testEmail };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -492,18 +574,21 @@ async function approveRequest(token) {
     const row = await getRequestByResponsableToken(token);
     if (!row) return { ok: false, error: 'invalid_or_expired' };
 
-    await applyManualCorrection(global.attendancePool, {
-        uid: row.uid,
-        matricule: row.matricule,
-        pointeuseUserId: null,
-        fullName: row.full_name,
-        cardNo: null,
-        date: row.work_date instanceof Date ? formatLocalDate(row.work_date) : String(row.work_date).split('T')[0],
-        arrivalTime: row.proposed_arrival_time,
-        departureTime: row.proposed_departure_time,
-        comment: row.employee_comment,
-        correctedBy: `responsable1:${row.responsable1_email}`,
-    });
+    // Synthetic test requests never touch real attendance data.
+    if (!row.is_test) {
+        await applyManualCorrection(global.attendancePool, {
+            uid: row.uid,
+            matricule: row.matricule,
+            pointeuseUserId: null,
+            fullName: row.full_name,
+            cardNo: null,
+            date: row.work_date instanceof Date ? formatLocalDate(row.work_date) : String(row.work_date).split('T')[0],
+            arrivalTime: row.proposed_arrival_time,
+            departureTime: row.proposed_departure_time,
+            comment: row.employee_comment,
+            correctedBy: `responsable1:${row.responsable1_email}`,
+        });
+    }
 
     const { rows } = await global.attendancePool.query(`
         UPDATE public.missing_point_requests
@@ -560,6 +645,9 @@ async function rejectRequest(token, rejectionComment) {
 module.exports = {
     ensureMissingPointRequestsTable,
     runDailySweep,
+    createSyntheticTestRequest,
+    isAutomationPaused,
+    setAutomationPaused,
     getRequestByEmployeeToken,
     getRequestByResponsableToken,
     submitEmployeeCorrection,

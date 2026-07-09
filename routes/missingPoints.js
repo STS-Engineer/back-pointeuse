@@ -157,17 +157,48 @@ router.post('/missing-point/review/:token/reject', async (req, res) => {
 // MANUAL / TESTABLE TRIGGER — POST /api/missing-points/run
 // ══════════════════════════════════════════════════════════════
 
+function checkAutomationKey(req, res) {
+    const expectedKey = process.env.MISSING_POINTS_API_KEY;
+    if (!expectedKey) {
+        res.status(503).json({ success: false, error: 'MISSING_POINTS_API_KEY is not configured on the server' });
+        return false;
+    }
+    if (req.header('x-automation-key') !== expectedKey) {
+        res.status(401).json({ success: false, error: 'Invalid or missing x-automation-key header' });
+        return false;
+    }
+    return true;
+}
+
+router.post('/api/missing-points/pause', async (req, res) => {
+    try {
+        if (!checkAutomationKey(req, res)) return;
+        const { paused = true } = req.body || {};
+        const result = await missingPoints.setAutomationPaused(paused);
+        res.json({ success: true, ...result });
+    } catch (error) {
+        console.error('❌ POST /api/missing-points/pause error:', error.message);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 router.post('/api/missing-points/run', async (req, res) => {
     try {
-        const expectedKey = process.env.MISSING_POINTS_API_KEY;
-        if (!expectedKey) {
-            return res.status(503).json({ success: false, error: 'MISSING_POINTS_API_KEY is not configured on the server' });
-        }
-        if (req.header('x-automation-key') !== expectedKey) {
-            return res.status(401).json({ success: false, error: 'Invalid or missing x-automation-key header' });
+        if (!checkAutomationKey(req, res)) return;
+
+        const { date, dryRun, testEmail } = req.body || {};
+
+        // Test mode: creates one fully synthetic request using only the
+        // given email (never real employee/HR data), so the whole loop can
+        // be exercised safely from a single inbox. Ignores date/dryRun.
+        if (testEmail) {
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(testEmail))) {
+                return res.status(400).json({ success: false, error: 'testEmail must be a valid email address' });
+            }
+            const result = await missingPoints.createSyntheticTestRequest(testEmail);
+            return res.json({ success: true, ...result });
         }
 
-        const { date, dryRun } = req.body || {};
         if (date && !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
             return res.status(400).json({ success: false, error: 'date must be YYYY-MM-DD' });
         }
