@@ -109,9 +109,9 @@ const server = app.listen(PORT, () => {
 
     console.log('⏰ Ingestion cron job scheduled — runs every hour');
 
-    // ── Missing attendance-point reminder cron (daily, Mon-Fri 07:00 Tunis time) ──
+    // ── Missing attendance-point reminder cron (daily, Mon-Fri 10:30 Tunis time) ──
     const { runDailySweep } = require('./services/missingPoints');
-    const missingPointsCronExpr = process.env.MISSING_POINTS_CRON || '0 10 * * 1-5';
+    const missingPointsCronExpr = process.env.MISSING_POINTS_CRON || '30 10 * * 1-5';
     cron.schedule(missingPointsCronExpr, async () => {
         console.log(`\n⏰ [CRON] Starting missing-points sweep at ${new Date().toISOString()}`);
         try {
