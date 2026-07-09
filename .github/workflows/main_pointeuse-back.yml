@@ -56,13 +56,18 @@ jobs:
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_75A47EAE218140C9B0CBC4ED3F5959FF }}
 
       - name: Set MISSING_POINTS_API_KEY app setting
-        if: ${{ secrets.MISSING_POINTS_API_KEY != '' }}
+        env:
+          MISSING_POINTS_API_KEY: ${{ secrets.MISSING_POINTS_API_KEY }}
         run: |
+          if [ -z "$MISSING_POINTS_API_KEY" ]; then
+            echo "MISSING_POINTS_API_KEY secret not set, skipping app setting update"
+            exit 0
+          fi
           RESOURCE_GROUP=$(az webapp list --query "[?name=='pointeuse-back'].resourceGroup" -o tsv)
           az webapp config appsettings set \
             --name pointeuse-back \
             --resource-group "$RESOURCE_GROUP" \
-            --settings MISSING_POINTS_API_KEY="${{ secrets.MISSING_POINTS_API_KEY }}"
+            --settings MISSING_POINTS_API_KEY="$MISSING_POINTS_API_KEY"
 
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
