@@ -604,12 +604,17 @@ async function approveRequest(token) {
 
     // Synthetic test requests never touch real attendance data.
     if (!row.is_test) {
+        const { rows: empRows } = await global.attendancePool.query(`
+            SELECT pointeuse_user_id, card_no FROM public.employees WHERE uid = $1
+        `, [row.uid]);
+        const emp = empRows[0] || {};
+
         await applyManualCorrection(global.attendancePool, {
             uid: row.uid,
             matricule: row.matricule,
-            pointeuseUserId: null,
+            pointeuseUserId: emp.pointeuse_user_id || null,
             fullName: row.full_name,
-            cardNo: null,
+            cardNo: emp.card_no || null,
             date: row.work_date instanceof Date ? formatLocalDate(row.work_date) : String(row.work_date).split('T')[0],
             arrivalTime: row.proposed_arrival_time,
             departureTime: row.proposed_departure_time,
