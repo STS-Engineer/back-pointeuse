@@ -60,14 +60,28 @@ async function fetchEarliestAttendanceDate(uid) {
  * Idempotent per employee: once updated_at reaches asOfDate, re-running is
  * a no-op for that employee (nothing to add), so this is safe to run daily
  * via cron or re-trigger manually without double-crediting.
+ *
+ * Pass { employeeIds, sinceDate } to force a manual rewind: re-checks the
+ * window from sinceDate forward even for employees already marked past it,
+ * and ADDS the freshly computed delta on top of their current balance. This
+ * is for the case where attendance data arrived AFTER the cron already ran
+ * for that window (e.g. the ZKTeco device was down and data got backfilled
+ * later) — the earlier pass genuinely credited 0 for those days since there
+ * was nothing to see yet, so adding the now-available delta on top is
+ * correct. It is NOT a general "redo any window" tool — if a window already
+ * contributed a non-zero delta, rewinding it would double-count that part.
  */
-async function recomputeLeaveBalances({ asOfDate } = {}) {
+async function recomputeLeaveBalances({ asOfDate, employeeIds = null, sinceDate = null } = {}) {
     const endDate = asOfDate || yesterdayInTz();
 
     const employees = await fetchActiveReportEmployees();
-    const eligible = employees.filter(e =>
+    let eligible = employees.filter(e =>
         e.uid !== null && e.uid !== undefined && e.hrId !== null && e.hrId !== undefined
     );
+    if (Array.isArray(employeeIds) && employeeIds.length) {
+        const idSet = new Set(employeeIds.map(Number));
+        eligible = eligible.filter(e => idSet.has(e.hrId));
+    }
     if (!eligible.length) return { processed: 0, skipped: 0, asOfDate: endDate };
 
     const { rows: existingRows } = await global.hrPool.query(
@@ -84,7 +98,9 @@ async function recomputeLeaveBalances({ asOfDate } = {}) {
     for (const emp of eligible) {
         const existing = existingByHrId.get(emp.hrId);
         let rangeStart;
-        if (existing) {
+        if (sinceDate) {
+            rangeStart = sinceDate;
+        } else if (existing) {
             rangeStart = addDaysStr(dateOnly(existing.updated_at), 1);
         } else {
             const earliest = await fetchEarliestAttendanceDate(emp.uid);
