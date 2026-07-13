@@ -20,17 +20,17 @@ router.get('/api/leave-balance', async (req, res) => {
     }
 });
 
-router.get('/api/leave-balance/:uid', async (req, res) => {
+router.get('/api/leave-balance/:employeeId', async (req, res) => {
     try {
-        const uid = Number(req.params.uid);
-        if (!Number.isFinite(uid)) {
-            return res.status(400).json({ success: false, error: 'uid must be numeric' });
+        const employeeId = Number(req.params.employeeId);
+        if (!Number.isFinite(employeeId)) {
+            return res.status(400).json({ success: false, error: 'employeeId must be numeric' });
         }
-        const row = await leaveBalance.getLeaveBalanceForUid(uid);
-        if (!row) return res.status(404).json({ success: false, error: 'no balance found for uid' });
+        const row = await leaveBalance.getLeaveBalanceForEmployeeId(employeeId);
+        if (!row) return res.status(404).json({ success: false, error: 'no balance found for employeeId' });
         res.json({ success: true, balance: row });
     } catch (error) {
-        console.error('❌ GET /api/leave-balance/:uid error:', error.message);
+        console.error('❌ GET /api/leave-balance/:employeeId error:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });

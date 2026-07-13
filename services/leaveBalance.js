@@ -11,34 +11,10 @@ const {
 
 const TIMEZONE = 'Africa/Tunis';
 
-// The accrual rate: 1.82 leave days earned per 173.33 credited hours.
-// 173.33h/1.82d is the standard full-time monthly reference (40h/week average),
-// applied continuously rather than in discrete monthly buckets — there's no
-// fixed payroll-month cutoff in this system, so balances just advance day by
-// day as credited hours accumulate.
+// 1.82 leave days earned per 173.33 credited hours (real work + approved
+// conge valued at 8h/day; holidays not credited), applied continuously.
 const ACCRUAL_HOURS_PER_UNIT = 173.33;
 const ACCRUAL_DAYS_PER_UNIT = 1.82;
-
-let tableEnsured = false;
-
-async function ensureLeaveBalanceTable() {
-    if (tableEnsured) return;
-    await global.attendancePool.query(`
-        CREATE TABLE IF NOT EXISTS public.leave_balance (
-            uid INTEGER PRIMARY KEY,
-            matricule TEXT,
-            full_name TEXT,
-            accrual_start_date DATE NOT NULL,
-            credited_hours NUMERIC(12,2) NOT NULL DEFAULT 0,
-            accrued_days NUMERIC(12,3) NOT NULL DEFAULT 0,
-            taken_days NUMERIC(12,3) NOT NULL DEFAULT 0,
-            balance_days NUMERIC(12,3) NOT NULL DEFAULT 0,
-            last_computed_date DATE,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-    `);
-    tableEnsured = true;
-}
 
 function yesterdayInTz() {
     return moment().tz(TIMEZONE).subtract(1, 'day').format('YYYY-MM-DD');
@@ -54,11 +30,9 @@ function dateOnly(value) {
 }
 
 // A day's credited hours toward accrual = actual worked minutes plus approved
-// congé valued at a full 8h. Half-day congé already contributes 4h via
-// workedMinutes and 4h via congeDays*8 (computeDayResult returns
-// workedMinutes:240, congeDays:0.5 for that case), so the two always sum to
-// a full 8h day. Holidays (jours fériés) are intentionally NOT credited here
-// — only actual work and approved congé count, per the accrual rule.
+// congé valued at a full 8h (half-day congé already contributes 4h via
+// workedMinutes and 4h via congeDays*8, per computeDayResult). Holidays are
+// intentionally NOT credited — only actual work and approved congé count.
 function creditedMinutesForDay(result) {
     return (result.workedMinutes || 0) + (result.congeDays || 0) * 8 * 60;
 }
@@ -72,58 +46,46 @@ async function fetchEarliestAttendanceDate(uid) {
 }
 
 /**
- * Advances active employees' leave balances through asOfDate (default:
- * yesterday — "today" may still be in progress and shouldn't be credited
- * until it's actually complete).
+ * Advances the REAL rh_application.leave_balances table (employee_id,
+ * balance, updated_at — a pre-existing table, not created by this
+ * codebase) through asOfDate (default: yesterday, since "today" may still
+ * be in progress).
  *
- * By default this is INCREMENTAL: each employee's last_computed_date means
- * already-processed days are never re-counted, so the daily cron can call
- * this repeatedly without double-crediting. The tradeoff is that a
- * retroactive correction to a PAST day (e.g. someone fixes a forgotten
- * punch from 3 days ago) will NOT be picked up automatically — that day has
- * already been locked into the running total.
+ * Each row's own updated_at IS the resume checkpoint — there is no separate
+ * bookkeeping table. Whatever balance is currently stored is trusted as
+ * correct as of that timestamp; only newly credited hours / newly taken
+ * congé since then get added on top. Employees with no existing row yet
+ * start from their earliest attendance record with balance 0.
  *
- * Pass { force: true } to instead fully rebuild an employee's balance from
- * their accrual_start_date forward, discarding whatever was stored before.
- * This is the manual "fix it now" path: call it (optionally scoped to
- * specific uids via { uids: [...] }) any time you know a correction landed,
- * and it becomes correct again from scratch — no need to know exactly which
- * days changed.
+ * Idempotent per employee: once updated_at reaches asOfDate, re-running is
+ * a no-op for that employee (nothing to add), so this is safe to run daily
+ * via cron or re-trigger manually without double-crediting.
  */
-async function recomputeLeaveBalances({ asOfDate, force = false, uids = null } = {}) {
-    await ensureLeaveBalanceTable();
+async function recomputeLeaveBalances({ asOfDate } = {}) {
     const endDate = asOfDate || yesterdayInTz();
 
     const employees = await fetchActiveReportEmployees();
-    let activeEmployees = employees.filter(e => e.uid !== null && e.uid !== undefined);
-    if (Array.isArray(uids) && uids.length) {
-        const uidSet = new Set(uids.map(Number));
-        activeEmployees = activeEmployees.filter(e => uidSet.has(e.uid));
-    }
-    if (!activeEmployees.length) return { processed: 0, skipped: 0, asOfDate: endDate };
-
-    const { rows: existingRows } = await global.attendancePool.query(
-        `SELECT * FROM public.leave_balance WHERE uid = ANY($1::int[])`,
-        [activeEmployees.map(e => e.uid)]
+    const eligible = employees.filter(e =>
+        e.uid !== null && e.uid !== undefined && e.hrId !== null && e.hrId !== undefined
     );
-    const existingByUid = new Map(existingRows.map(r => [r.uid, r]));
+    if (!eligible.length) return { processed: 0, skipped: 0, asOfDate: endDate };
+
+    const { rows: existingRows } = await global.hrPool.query(
+        `SELECT employee_id, balance, updated_at FROM public.leave_balances WHERE employee_id = ANY($1::int[])`,
+        [eligible.map(e => e.hrId)]
+    );
+    const existingByHrId = new Map(existingRows.map(r => [r.employee_id, r]));
 
     // Work out each employee's [rangeStart, endDate] window first, and the
     // earliest rangeStart across everyone, so attendance/requests/special
     // days can be fetched once for the whole span instead of per employee.
-    // In force mode, rangeStart always goes back to accrual_start_date (or
-    // the earliest attendance record if there's no existing row yet) instead
-    // of resuming from last_computed_date, and the previous stored totals
-    // are treated as zero (full rebuild, not a delta on top of them).
     const plans = [];
     let overallStart = null;
-    for (const emp of activeEmployees) {
-        const existing = existingByUid.get(emp.uid);
+    for (const emp of eligible) {
+        const existing = existingByHrId.get(emp.hrId);
         let rangeStart;
-        if (existing && !force) {
-            rangeStart = addDaysStr(dateOnly(existing.last_computed_date), 1);
-        } else if (existing && force) {
-            rangeStart = dateOnly(existing.accrual_start_date);
+        if (existing) {
+            rangeStart = addDaysStr(dateOnly(existing.updated_at), 1);
         } else {
             const earliest = await fetchEarliestAttendanceDate(emp.uid);
             if (!earliest) continue; // never punched in yet — nothing to accrue
@@ -131,11 +93,11 @@ async function recomputeLeaveBalances({ asOfDate, force = false, uids = null } =
         }
         if (rangeStart > endDate) continue; // already up to date
 
-        plans.push({ emp, existing: force ? null : existing, rangeStart });
+        plans.push({ emp, existing, rangeStart });
         if (overallStart === null || rangeStart < overallStart) overallStart = rangeStart;
     }
 
-    if (!plans.length) return { processed: 0, skipped: activeEmployees.length, asOfDate: endDate };
+    if (!plans.length) return { processed: 0, skipped: eligible.length, asOfDate: endDate };
 
     const weekDays = enumerateWeekdays(overallStart, endDate);
     const activeUids = plans.map(p => p.emp.uid);
@@ -171,62 +133,43 @@ async function recomputeLeaveBalances({ asOfDate, force = false, uids = null } =
             takenDaysDelta += result.congeDays || 0;
         }
 
-        const prevCreditedHours = existing ? Number(existing.credited_hours) : 0;
-        const prevTakenDays = existing ? Number(existing.taken_days) : 0;
-        const accrualStartDate = existing ? dateOnly(existing.accrual_start_date) : rangeStart;
+        const accruedDelta = (creditedMinutesDelta / 60 / ACCRUAL_HOURS_PER_UNIT) * ACCRUAL_DAYS_PER_UNIT;
+        const prevBalance = existing ? Number(existing.balance) : 0;
+        const newBalance = prevBalance + accruedDelta - takenDaysDelta;
 
-        const creditedHours = prevCreditedHours + creditedMinutesDelta / 60;
-        const takenDays = prevTakenDays + takenDaysDelta;
-        const accruedDays = (creditedHours / ACCRUAL_HOURS_PER_UNIT) * ACCRUAL_DAYS_PER_UNIT;
-        const balanceDays = accruedDays - takenDays;
-
-        await global.attendancePool.query(`
-            INSERT INTO public.leave_balance
-                (uid, matricule, full_name, accrual_start_date, credited_hours, accrued_days, taken_days, balance_days, last_computed_date, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())
-            ON CONFLICT (uid) DO UPDATE SET
-                matricule = EXCLUDED.matricule,
-                full_name = EXCLUDED.full_name,
-                credited_hours = EXCLUDED.credited_hours,
-                accrued_days = EXCLUDED.accrued_days,
-                taken_days = EXCLUDED.taken_days,
-                balance_days = EXCLUDED.balance_days,
-                last_computed_date = EXCLUDED.last_computed_date,
-                updated_at = now()
-        `, [
-            emp.uid, emp.matricule, emp.name, accrualStartDate,
-            creditedHours.toFixed(2), accruedDays.toFixed(3), takenDays.toFixed(3), balanceDays.toFixed(3),
-            endDate,
-        ]);
+        await global.hrPool.query(`
+            INSERT INTO public.leave_balances (employee_id, balance, updated_at)
+            VALUES ($1, $2, now())
+            ON CONFLICT (employee_id) DO UPDATE SET
+                balance = EXCLUDED.balance,
+                updated_at = EXCLUDED.updated_at
+        `, [emp.hrId, newBalance.toFixed(3)]);
 
         processed++;
     }
 
-    return { processed, skipped: activeEmployees.length - processed, asOfDate: endDate };
+    return { processed, skipped: eligible.length - processed, asOfDate: endDate };
 }
 
 async function getAllLeaveBalances() {
-    await ensureLeaveBalanceTable();
-    const { rows } = await global.attendancePool.query(
-        `SELECT * FROM public.leave_balance ORDER BY full_name`
+    const { rows } = await global.hrPool.query(
+        `SELECT * FROM public.leave_balances ORDER BY employee_id`
     );
     return rows;
 }
 
-async function getLeaveBalanceForUid(uid) {
-    await ensureLeaveBalanceTable();
-    const { rows } = await global.attendancePool.query(
-        `SELECT * FROM public.leave_balance WHERE uid = $1`,
-        [uid]
+async function getLeaveBalanceForEmployeeId(employeeId) {
+    const { rows } = await global.hrPool.query(
+        `SELECT * FROM public.leave_balances WHERE employee_id = $1`,
+        [employeeId]
     );
     return rows[0] || null;
 }
 
 module.exports = {
-    ensureLeaveBalanceTable,
     recomputeLeaveBalances,
     getAllLeaveBalances,
-    getLeaveBalanceForUid,
+    getLeaveBalanceForEmployeeId,
     ACCRUAL_HOURS_PER_UNIT,
     ACCRUAL_DAYS_PER_UNIT,
 };
