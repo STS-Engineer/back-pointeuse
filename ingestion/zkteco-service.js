@@ -67,6 +67,17 @@ class ZktecoService {
             { uid: 58, name: 'Sondes Rahmouni',           matricule: '58', pointeuseUserId: '40058' },
             { uid: 59, name: 'Haythem Debbich',           matricule: '59', pointeuseUserId: '40059' },
             { uid: 60, name: 'Eya Grati',                 matricule: '60', pointeuseUserId: '40060' },
+            // NEW EMPLOYEES (added — were missing from ingestion, matricules 61-69
+            // existed in HR/leave-balance data but were never enrolled here)
+            { uid: 61, name: 'Ghada Alaya',                matricule: '61', pointeuseUserId: '40061' },
+            { uid: 62, name: 'Douaa Hammami',              matricule: '62', pointeuseUserId: '40062' },
+            { uid: 63, name: 'Abir Ben Toumi',             matricule: '63', pointeuseUserId: '40063' },
+            { uid: 64, name: 'Hadil Moldi',                matricule: '64', pointeuseUserId: '40064' },
+            { uid: 65, name: 'Youssef Ben Amor Che',       matricule: '65', pointeuseUserId: '40065' },
+            { uid: 66, name: 'Hamdi Aouichaoui',           matricule: '66', pointeuseUserId: '40066' },
+            { uid: 67, name: 'Hiba Essid',                 matricule: '67', pointeuseUserId: '40067' },
+            { uid: 68, name: 'Chaima Haffar',              matricule: '68', pointeuseUserId: '40068' },
+            { uid: 69, name: 'Hassen Jlassi',              matricule: '69', pointeuseUserId: '40069' },
         ];
 
         // Maps pour recherche rapide
