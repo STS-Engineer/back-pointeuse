@@ -236,6 +236,24 @@ function getAuthorizationMinutes(req) {
     return end - start;
 }
 
+// Autorisation is an APPROVED ABSENCE — the employee was away, not working.
+// Only the portion of the authorization window that overlaps the actual
+// punched arrival→departure span was counted as "physically present" and
+// must be subtracted back out. A window entirely before arrival (authorized
+// late arrival) or entirely after departure (authorized early leave) is
+// already reflected by the shorter punched span itself — there's nothing to
+// subtract there, since that time was never counted as worked in the first
+// place. Subtracting it anyway would double-penalize the employee.
+function getAuthorizationOverlapMinutes(req, arrivalMin, departureMin) {
+    if (arrivalMin === null || departureMin === null) return 0;
+    const start = toMinutesFromTime(req.heure_depart);
+    const end = toMinutesFromTime(req.heure_retour);
+    if (start === null || end === null || end <= start) return 0;
+    const overlapStart = Math.max(start, arrivalMin);
+    const overlapEnd = Math.min(end, departureMin);
+    return Math.max(0, overlapEnd - overlapStart);
+}
+
 function enumerateWeekdays(startDateStr, endDateStr) {
     const dates = [];
     const current = parseLocalDate(startDateStr);
@@ -521,25 +539,29 @@ function computeDayResult(attendanceRow, requestsForDay, currentDate, specialDay
     const lateMinutes = late ? getLateMinutes(arrival) : 0;
 
     if (workedRaw !== null) {
-        // Approved mission/authorisation time fills missing work time up to a normal
-        // 8h day, but does not inflate an already complete pointage day.
-        let finalMinutes = workedRaw;
+        // ✅ FIX (autorisation overpayment bug): autorisation is an approved
+        // ABSENCE, not extra work — only the part of it that overlaps the
+        // punched span (i.e. the employee was marked present but was actually
+        // authorized to be away) gets subtracted back out of physical
+        // presence. Mission still fills missing work time up to a normal 8h
+        // day as before (mission = worked elsewhere, genuinely credited time).
+        const arrivalMin = toMinutesFromTime(arrival);
+        const departureMin = toMinutesFromTime(departure);
+        const totalAuthOverlapMins = autorisations.reduce(
+            (s, r) => s + getAuthorizationOverlapMinutes(r, arrivalMin, departureMin), 0
+        );
+
+        let finalMinutes = Math.max(0, workedRaw - totalAuthOverlapMins);
         let detail = `${arrival} → ${departure}`;
         const notes = [];
-        let correctionMinutes = 0;
 
         if (totalAuthMins > 0) {
-            correctionMinutes += totalAuthMins;
             notes.push(`autorisation ${formatMinutesToHours(totalAuthMins)}`);
         }
 
         if (totalMissionMins > 0) {
-            correctionMinutes += totalMissionMins;
+            finalMinutes = Math.max(finalMinutes, Math.min(8 * 60, finalMinutes + totalMissionMins));
             notes.push(`mission ${formatMinutesToHours(totalMissionMins)}`);
-        }
-
-        if (correctionMinutes > 0) {
-            finalMinutes = Math.max(workedRaw, Math.min(8 * 60, workedRaw + correctionMinutes));
         }
 
         if (notes.length) detail += ` (${notes.join(', ')})`;
