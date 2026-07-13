@@ -53,6 +53,9 @@ app.use('/api', attendanceRoutes);
 const missingPointsRoutes = require('./routes/missingPoints');
 app.use(missingPointsRoutes);
 
+const leaveBalanceRoutes = require('./routes/leaveBalance');
+app.use(leaveBalanceRoutes);
+
 // ── Health check ───────────────────────────────────────────────
 app.get('/health', (req, res) => {
     res.json({
@@ -124,6 +127,22 @@ const server = app.listen(PORT, () => {
     }, { timezone: 'Africa/Tunis' });
 
     console.log(`⏰ Missing-points sweep cron job scheduled — "${missingPointsCronExpr}" (Africa/Tunis)`);
+
+    // ── Leave-balance accrual cron (daily, after ingestion has settled) ──
+    const { recomputeLeaveBalances } = require('./services/leaveBalance');
+    const leaveBalanceCronExpr = process.env.LEAVE_BALANCE_CRON || '0 2 * * *';
+    cron.schedule(leaveBalanceCronExpr, async () => {
+        console.log(`\n⏰ [CRON] Starting leave-balance recompute at ${new Date().toISOString()}`);
+        try {
+            const result = await recomputeLeaveBalances();
+            console.log(`✅ [CRON] Leave-balance recompute completed: ${JSON.stringify(result)}`);
+        } catch (err) {
+            console.error('❌ [CRON] Leave-balance recompute failed:', err.message);
+            // ← never crashes the server, just logs the error
+        }
+    }, { timezone: 'Africa/Tunis' });
+
+    console.log(`⏰ Leave-balance accrual cron job scheduled — "${leaveBalanceCronExpr}" (Africa/Tunis)`);
 });
 
 // ── Graceful shutdown ──────────────────────────────────────────
