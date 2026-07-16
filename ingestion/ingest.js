@@ -98,14 +98,11 @@ async function insertRawLogs(rawLogs) {
     `;
     let inserted = 0;
     for (const l of rawLogs) {
-      // NOTE: the -1h offset below compensates for the Azure VM clock being 1 hour
-      // ahead of Africa/Tunis local time. If the VM timezone is ever corrected,
-      // remove this offset and re-verify punch times in the dashboard before deploying.
       const res = await client.query(sql, [
         String(l.uid),
         String(l.userid),
         l.pointeuseUserId ? String(l.pointeuseUserId) : null,
-        new Date(new Date(l.timestamp).getTime() - 60 * 60 * 1000),
+        new Date(l.timestamp),
         l.state ?? 0,
         l.type ?? 0,
         l.rawLog ? l.rawLog : null,

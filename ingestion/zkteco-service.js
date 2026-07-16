@@ -221,10 +221,18 @@ class ZktecoService {
                             ];
                             let parsedDate = null;
 
-                            if (
+                            if (recordTime.includes('GMT')) {
+                                // zkteco-js builds this string via `new Date(y,m,d,h,mi,s).toString()`,
+                                // where y/m/d/h/mi/s are the device's raw wall-clock reading (Africa/Tunis,
+                                // since that's where the device physically is) but the embedded GMT offset
+                                // reflects whatever timezone THIS Node process happens to run in — not the
+                                // device's. Trusting that offset (via parseZone) makes the parsed time drift
+                                // whenever the host's timezone isn't Africa/Tunis. Instead, strip the offset
+                                // and re-anchor the same Y/M/D H:m:s numbers directly as Africa/Tunis time.
+                                parsedDate = moment.tz(recordTime, 'ddd MMM DD YYYY HH:mm:ss', 'Africa/Tunis');
+                            } else if (
                                 recordTime.includes('Z') ||
-                                /[+-]\d{2}:?\d{2}$/.test(recordTime) ||
-                                recordTime.includes('GMT')
+                                /[+-]\d{2}:?\d{2}$/.test(recordTime)
                             ) {
                                 parsedDate = moment.parseZone(recordTime);
                             } else {
