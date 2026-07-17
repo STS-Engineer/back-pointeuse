@@ -91,10 +91,14 @@ async function insertRawLogs(rawLogs) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Keyed on the raw device string (not the parsed ts) so re-parsing the same physical
+    // punch under different/fixed timezone logic can never insert it twice again — this is
+    // what let old +1h-mis-parsed rows and later correctly-parsed rows of the same punch
+    // both survive as separate "phantom" entries.
     const sql = `
       INSERT INTO attendance_logs_raw (uid, userid, pointeuse_user_id, ts, state, verify_type, raw_log)
       VALUES ($1,$2,$3,$4,$5,$6,$7)
-      ON CONFLICT (uid, ts, verify_type) DO NOTHING
+      ON CONFLICT (uid, verify_type, (raw_log->>'record_time')) DO NOTHING
     `;
     let inserted = 0;
     for (const l of rawLogs) {
