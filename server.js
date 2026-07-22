@@ -70,6 +70,18 @@ app.get('/health', (req, res) => {
     });
 });
 
+// ── TEMP diagnostic: confirm the VM's default timezone vs Africa/Tunis
+// (to be removed once the remote-attendance cron timing is confirmed) ──
+app.get('/api/_tz-check', (req, res) => {
+    const moment = require('moment-timezone');
+    res.json({
+        rawUtcNow: new Date().toISOString(),
+        vmDefaultTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        processEnvTZ: process.env.TZ || null,
+        computedTunisNow: moment().tz('Africa/Tunis').format('YYYY-MM-DD HH:mm:ss Z'),
+    });
+});
+
 // ── 404 handler ────────────────────────────────────────────────
 app.use('*', (req, res) => {
     res.status(404).json({ error: 'Route not found', path: req.originalUrl });
