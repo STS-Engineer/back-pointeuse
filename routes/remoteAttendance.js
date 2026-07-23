@@ -50,6 +50,10 @@ function alreadyConfirmedPage(recordedTime) {
     return page('Déjà confirmé', `<h1>Déjà confirmé</h1><p>Ce pointage a déjà été enregistré à <strong>${escapeHtml(recordedTime || '')}</strong>.</p>`);
 }
 
+function alreadyRecordedPage(existingTime) {
+    return page('Déjà enregistré', `<h1>Déjà enregistré</h1><p>Une heure est déjà enregistrée pour aujourd'hui (<strong>${escapeHtml(existingTime || '')}</strong>), probablement via un badgeage réel. Aucune action n'est nécessaire.</p>`);
+}
+
 // ══════════════════════════════════════════════════════════════
 // PUBLIC PUNCH CONFIRMATION
 // GET shows a page with a single button; the actual recording only
@@ -67,6 +71,12 @@ router.get('/remote-attendance/punch/:token', async (req, res) => {
         if (row.used_at) return res.send(alreadyConfirmedPage(row.recorded_time));
 
         const workDate = row.work_date instanceof Date ? row.work_date.toISOString().split('T')[0] : String(row.work_date).split('T')[0];
+
+        if (!row.is_test) {
+            const existingTime = await remoteAttendance.getExistingRecordedTime(row.uid, workDate, row.punch_type);
+            if (existingTime) return res.send(alreadyRecordedPage(existingTime));
+        }
+
         const isArrival = row.punch_type === 'arrival';
         const token = encodeURIComponent(req.params.token);
 
@@ -88,6 +98,7 @@ router.post('/remote-attendance/punch/:token', async (req, res) => {
         const result = await remoteAttendance.confirmPunch(req.params.token);
         if (!result.ok) {
             if (result.error === 'already_used') return res.send(alreadyConfirmedPage(result.row.recorded_time));
+            if (result.error === 'already_recorded') return res.send(alreadyRecordedPage(result.existingTime));
             return res.status(400).send(invalidLinkPage());
         }
 

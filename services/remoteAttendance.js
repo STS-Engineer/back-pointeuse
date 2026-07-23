@@ -209,6 +209,21 @@ async function getPunchByToken(token) {
     return rows[0] || null;
 }
 
+// Guards against a remote click clobbering a real, already-recorded time
+// (e.g. someone who badged in at the office that day and also opens the
+// remote-attendance email). attendance_daily is the source of truth here,
+// not this table — a real ZKTeco punch or an HR correction may have landed
+// there through a completely different path.
+async function getExistingRecordedTime(uid, workDate, punchType) {
+    const { rows } = await global.attendancePool.query(`
+        SELECT arrival_time, departure_time FROM public.attendance_daily WHERE uid = $1 AND work_date = $2
+    `, [uid, workDate]);
+    const row = rows[0];
+    if (!row) return null;
+    const value = punchType === 'arrival' ? row.arrival_time : row.departure_time;
+    return value ? String(value).slice(0, 5) : null;
+}
+
 /**
  * Emails every active employee their arrival or departure confirmation link
  * for the given date. Idempotent: an employee who already has a punch row
@@ -321,6 +336,9 @@ async function confirmPunch(token) {
 
     // Synthetic test punches never touch real attendance data.
     if (!row.is_test) {
+        const existingTime = await getExistingRecordedTime(row.uid, workDate, row.punch_type);
+        if (existingTime) return { ok: false, error: 'already_recorded', existingTime, row };
+
         const { rows: empRows } = await global.attendancePool.query(`
             SELECT pointeuse_user_id, card_no FROM public.employees WHERE uid = $1
         `, [row.uid]);
@@ -359,5 +377,6 @@ module.exports = {
     sendPunchLinksForDate,
     createSyntheticTestPunch,
     getPunchByToken,
+    getExistingRecordedTime,
     confirmPunch,
 };
