@@ -37,35 +37,13 @@ function makeHrPool(employeesByMatricule) {
     };
 }
 
-function makeAttendancePool({ employeesByMatricule, dailyRows = {}, credentialsByMatricule = {}, pinTokensByToken = {} }) {
+function makeAttendancePool({ employeesByMatricule, dailyRows = {}, credentialsByMatricule = {} }) {
     const daily = { ...dailyRows };
     const credentials = { ...credentialsByMatricule };
-    const pinTokens = { ...pinTokensByToken };
-    let nextTokenId = 1000;
     const calls = { connectCount: 0, inserts: [] };
 
     const directQuery = async (sql, params) => {
         if (sql.includes('CREATE TABLE')) return { rows: [] };
-
-        if (sql.includes('INSERT INTO public.self_pointage_pin_tokens')) {
-            const [matricule, token, expiresAt] = params;
-            const row = { id: nextTokenId++, matricule, token, expires_at: expiresAt, used_at: null };
-            pinTokens[token] = row;
-            return { rows: [row] };
-        }
-
-        if (sql.includes('SELECT * FROM public.self_pointage_pin_tokens')) {
-            const [token] = params;
-            const row = pinTokens[token];
-            return { rows: row ? [row] : [] };
-        }
-
-        if (sql.includes('UPDATE public.self_pointage_pin_tokens')) {
-            const [id] = params;
-            const row = Object.values(pinTokens).find(r => r.id === id);
-            if (row) row.used_at = new Date();
-            return { rows: row ? [row] : [] };
-        }
 
         if (sql.includes('INSERT INTO public.self_pointage_credentials')) {
             const [matricule, pinHash] = params;
@@ -142,7 +120,6 @@ function makeAttendancePool({ employeesByMatricule, dailyRows = {}, credentialsB
         _calls: calls,
         _daily: daily,
         _credentials: credentials,
-        _pinTokens: pinTokens,
     };
 }
 
@@ -176,7 +153,7 @@ test('POST /pin/request sends no email and gives a generic response for an unkno
     assert.equal(mailCalls.length, 0);
 });
 
-test('POST /pin/request emails a setup link for a known active matricule', async () => {
+test('POST /pin/request emails a freshly generated 6-digit code and stores its hash', async () => {
     const pool = setupGlobals({
         hrEmployeesByMatricule: { M001: ACTIVE_EMPLOYEE_HR },
         employeesByMatricule: { M001: ATT_ROW },
@@ -191,103 +168,28 @@ test('POST /pin/request emails a setup link for a known active matricule', async
     assert.equal(res.statusCode, 200);
     assert.equal(mailCalls.length, 1);
     assert.equal(mailCalls[0].to, 'jane.doe@avocarbon.com');
-    assert.equal(Object.keys(pool._pinTokens).length, 1);
+
+    const match = mailCalls[0].html.match(/(\d{6})/);
+    assert.ok(match, 'email body must contain the 6-digit code');
+    assert.ok(bcrypt.compareSync(match[1], pool._credentials.M001.pin_hash));
 });
 
-// ── /pin/token/:token ────────────────────────────────────────────
-
-test('GET /pin/token/:token rejects an unknown token', async () => {
-    setupGlobals({ hrEmployeesByMatricule: { M001: ACTIVE_EMPLOYEE_HR }, employeesByMatricule: { M001: ATT_ROW } });
-    const handler = getRouteHandler(selfPointageRouter, 'get', '/pin/token/:token');
-
-    const req = { params: { token: 'nope' } };
-    const res = mockRes();
-    await handler(req, res);
-
-    assert.equal(res.statusCode, 404);
-});
-
-test('GET /pin/token/:token rejects an expired token', async () => {
-    setupGlobals({
-        hrEmployeesByMatricule: { M001: ACTIVE_EMPLOYEE_HR },
-        employeesByMatricule: { M001: ATT_ROW },
-        pinTokensByToken: { abc: { id: 1, matricule: 'M001', token: 'abc', expires_at: new Date(Date.now() - 1000), used_at: null } },
-    });
-    const handler = getRouteHandler(selfPointageRouter, 'get', '/pin/token/:token');
-
-    const req = { params: { token: 'abc' } };
-    const res = mockRes();
-    await handler(req, res);
-
-    assert.equal(res.statusCode, 400);
-    assert.equal(res.body.error, 'expired');
-});
-
-test('GET /pin/token/:token returns the employee for a valid token', async () => {
-    setupGlobals({
-        hrEmployeesByMatricule: { M001: ACTIVE_EMPLOYEE_HR },
-        employeesByMatricule: { M001: ATT_ROW },
-        pinTokensByToken: { abc: { id: 1, matricule: 'M001', token: 'abc', expires_at: new Date(Date.now() + 60000), used_at: null } },
-    });
-    const handler = getRouteHandler(selfPointageRouter, 'get', '/pin/token/:token');
-
-    const req = { params: { token: 'abc' } };
-    const res = mockRes();
-    await handler(req, res);
-
-    assert.equal(res.statusCode, 200);
-    assert.equal(res.body.matricule, 'M001');
-    assert.equal(res.body.fullName, 'Jane Doe');
-});
-
-// ── /pin/confirm ─────────────────────────────────────────────────
-
-test('POST /pin/confirm rejects a non-6-digit pin', async () => {
-    setupGlobals({
-        hrEmployeesByMatricule: { M001: ACTIVE_EMPLOYEE_HR },
-        employeesByMatricule: { M001: ATT_ROW },
-        pinTokensByToken: { abc: { id: 1, matricule: 'M001', token: 'abc', expires_at: new Date(Date.now() + 60000), used_at: null } },
-    });
-    const handler = getRouteHandler(selfPointageRouter, 'post', '/pin/confirm');
-
-    const req = { body: { token: 'abc', pin: '12345' } };
-    const res = mockRes();
-    await handler(req, res);
-
-    assert.equal(res.statusCode, 400);
-});
-
-test('POST /pin/confirm sets a verifiable PIN hash and marks the token used', async () => {
+test('POST /pin/request replaces any previously set code', async () => {
+    const oldHash = bcrypt.hashSync('111111', 4);
     const pool = setupGlobals({
         hrEmployeesByMatricule: { M001: ACTIVE_EMPLOYEE_HR },
         employeesByMatricule: { M001: ATT_ROW },
-        pinTokensByToken: { abc: { id: 1, matricule: 'M001', token: 'abc', expires_at: new Date(Date.now() + 60000), used_at: null } },
+        credentialsByMatricule: { M001: { pin_hash: oldHash, failed_attempts: 3, locked_until: null } },
     });
-    const handler = getRouteHandler(selfPointageRouter, 'post', '/pin/confirm');
+    const mailCalls = stubMailer();
+    const handler = getRouteHandler(selfPointageRouter, 'post', '/pin/request');
 
-    const req = { body: { token: 'abc', pin: '135790' } };
-    const res = mockRes();
-    await handler(req, res);
+    await handler({ body: { matricule: 'M001' } }, mockRes());
 
-    assert.equal(res.statusCode, 200);
-    assert.ok(bcrypt.compareSync('135790', pool._credentials.M001.pin_hash));
-    assert.equal(pool._pinTokens.abc.used_at !== null, true);
-});
-
-test('POST /pin/confirm rejects reusing an already-used token', async () => {
-    setupGlobals({
-        hrEmployeesByMatricule: { M001: ACTIVE_EMPLOYEE_HR },
-        employeesByMatricule: { M001: ATT_ROW },
-        pinTokensByToken: { abc: { id: 1, matricule: 'M001', token: 'abc', expires_at: new Date(Date.now() + 60000), used_at: new Date() } },
-    });
-    const handler = getRouteHandler(selfPointageRouter, 'post', '/pin/confirm');
-
-    const req = { body: { token: 'abc', pin: '135790' } };
-    const res = mockRes();
-    await handler(req, res);
-
-    assert.equal(res.statusCode, 400);
-    assert.equal(res.body.error, 'already_used');
+    assert.equal(bcrypt.compareSync('111111', pool._credentials.M001.pin_hash), false, 'old code must no longer work');
+    assert.equal(pool._credentials.M001.failed_attempts, 0, 'failed attempts must reset with the new code');
+    const match = mailCalls[0].html.match(/(\d{6})/);
+    assert.ok(bcrypt.compareSync(match[1], pool._credentials.M001.pin_hash));
 });
 
 // ── /login ───────────────────────────────────────────────────────

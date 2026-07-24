@@ -18,10 +18,12 @@ function intEnv(name, defaultValue) {
 }
 
 const SESSION_TTL_HOURS = intEnv('SELF_POINTAGE_SESSION_TTL_HOURS', 12);
-const PIN_TOKEN_TTL_MINUTES = intEnv('SELF_POINTAGE_PIN_TOKEN_TTL_MINUTES', 30);
 const MAX_FAILED_ATTEMPTS = intEnv('SELF_POINTAGE_MAX_FAILED_ATTEMPTS', 5);
 const LOCKOUT_MINUTES = intEnv('SELF_POINTAGE_LOCKOUT_MINUTES', 15);
-const FRONTEND_URL = (process.env.POINTAGE_FRONTEND_URL || 'https://pointeuse-sts.azurewebsites.net/pointage.html').replace(/\/+$/, '');
+
+function generatePin() {
+    return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+}
 
 function todayInTz() {
     return moment().tz(TIMEZONE).format('YYYY-MM-DD');
@@ -55,23 +57,6 @@ async function ensureCredentialsTable() {
         )
     `);
     credentialsTableEnsured = true;
-}
-
-let pinTokensTableEnsured = false;
-
-async function ensurePinTokensTable() {
-    if (pinTokensTableEnsured) return;
-    await global.attendancePool.query(`
-        CREATE TABLE IF NOT EXISTS public.self_pointage_pin_tokens (
-            id SERIAL PRIMARY KEY,
-            matricule TEXT NOT NULL,
-            token TEXT UNIQUE NOT NULL,
-            expires_at TIMESTAMPTZ NOT NULL,
-            used_at TIMESTAMPTZ,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-    `);
-    pinTokensTableEnsured = true;
 }
 
 // Resolves an employee by matricule against BOTH databases (HR = source of
@@ -136,119 +121,49 @@ router.post('/pin/request', async (req, res) => {
         const { matricule } = req.body || {};
         if (!matricule) return res.status(400).json({ success: false, error: 'matricule is required' });
 
-        await ensurePinTokensTable();
+        await ensureCredentialsTable();
         const employee = await resolveActiveEmployeeByMatricule(matricule);
 
         if (employee && employee.email) {
-            const token = crypto.randomBytes(32).toString('hex');
-            const expiresAt = moment().add(PIN_TOKEN_TTL_MINUTES, 'minutes').toDate();
+            const pin = generatePin();
+            const pinHash = await bcrypt.hash(pin, 10);
 
+            // Generating a new code immediately replaces the previous one —
+            // same trade-off as any "forgot password" reset flow.
             await global.attendancePool.query(`
-                INSERT INTO public.self_pointage_pin_tokens (matricule, token, expires_at)
-                VALUES ($1, $2, $3)
-            `, [employee.matricule, token, expiresAt]);
+                INSERT INTO public.self_pointage_credentials (matricule, pin_hash, failed_attempts, locked_until, updated_at)
+                VALUES ($1, $2, 0, NULL, now())
+                ON CONFLICT (matricule) DO UPDATE SET
+                    pin_hash = EXCLUDED.pin_hash,
+                    failed_attempts = 0,
+                    locked_until = NULL,
+                    updated_at = now()
+            `, [employee.matricule, pinHash]);
 
-            const link = `${FRONTEND_URL}?token=${token}`;
             try {
                 await mailer.sendMail({
                     to: employee.email,
-                    subject: 'Pointeuse — définissez votre code de pointage',
+                    subject: 'Pointeuse — votre code de pointage',
                     html: `
                         <p>Bonjour ${employee.fullName || ''},</p>
-                        <p>Cliquez sur le lien ci-dessous pour définir (ou réinitialiser) votre code à 6 chiffres utilisé pour pointer votre arrivée et votre départ :</p>
-                        <p><a href="${link}">${link}</a></p>
-                        <p>Ce lien est valable ${PIN_TOKEN_TTL_MINUTES} minutes.</p>
+                        <p>Voici votre code à 6 chiffres utilisé pour pointer votre arrivée et votre départ :</p>
+                        <p style="font-size:24px; font-weight:bold; letter-spacing:4px;">${pin}</p>
+                        <p>Ce code remplace tout code précédent. Ne le partagez avec personne.</p>
                     `,
                 });
             } catch (mailError) {
                 // Don't let an SMTP failure 500 this request — that would leak,
                 // via the status code, that the matricule matched (unlike the
                 // generic response below). Log and fall through instead.
-                console.error(`❌ [self-pointage] failed to email PIN-setup link to matricule=${employee.matricule}:`, mailError.message);
+                console.error(`❌ [self-pointage] failed to email PIN to matricule=${employee.matricule}:`, mailError.message);
             }
         }
 
         // Same response whether or not the matricule matched an active
         // employee, so this endpoint never reveals which matricules exist.
-        res.json({ success: true, message: "Si ce matricule existe, un email a été envoyé." });
+        res.json({ success: true, message: "Si ce matricule existe, un code a été envoyé par email." });
     } catch (error) {
         console.error('❌ POST /self-pointage/pin/request error:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ══════════════════════════════════════════════════════════════
-// GET /api/self-pointage/pin/token/:token
-// ══════════════════════════════════════════════════════════════
-
-router.get('/pin/token/:token', async (req, res) => {
-    try {
-        await ensurePinTokensTable();
-        const { rows } = await global.attendancePool.query(`
-            SELECT * FROM public.self_pointage_pin_tokens WHERE token = $1
-        `, [req.params.token]);
-        const row = rows[0];
-
-        if (!row) return res.status(404).json({ success: false, error: 'invalid_token' });
-        if (row.used_at) return res.status(400).json({ success: false, error: 'already_used' });
-        if (moment(row.expires_at).isBefore(moment())) return res.status(400).json({ success: false, error: 'expired' });
-
-        const employee = await resolveActiveEmployeeByMatricule(row.matricule);
-        if (!employee) return res.status(404).json({ success: false, error: 'employee_not_found' });
-
-        res.json({ success: true, matricule: employee.matricule, fullName: employee.fullName });
-    } catch (error) {
-        console.error('❌ GET /self-pointage/pin/token error:', error.message);
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ══════════════════════════════════════════════════════════════
-// POST /api/self-pointage/pin/confirm { token, pin }
-// ══════════════════════════════════════════════════════════════
-
-router.post('/pin/confirm', async (req, res) => {
-    try {
-        const { token, pin } = req.body || {};
-        if (!token) return res.status(400).json({ success: false, error: 'token is required' });
-        if (!/^\d{6}$/.test(String(pin || ''))) {
-            return res.status(400).json({ success: false, error: 'pin must be exactly 6 digits' });
-        }
-
-        await ensurePinTokensTable();
-        await ensureCredentialsTable();
-
-        const { rows } = await global.attendancePool.query(`
-            SELECT * FROM public.self_pointage_pin_tokens WHERE token = $1
-        `, [token]);
-        const row = rows[0];
-
-        if (!row) return res.status(404).json({ success: false, error: 'invalid_token' });
-        if (row.used_at) return res.status(400).json({ success: false, error: 'already_used' });
-        if (moment(row.expires_at).isBefore(moment())) return res.status(400).json({ success: false, error: 'expired' });
-
-        const employee = await resolveActiveEmployeeByMatricule(row.matricule);
-        if (!employee) return res.status(404).json({ success: false, error: 'employee_not_found' });
-
-        const pinHash = await bcrypt.hash(String(pin), 10);
-
-        await global.attendancePool.query(`
-            INSERT INTO public.self_pointage_credentials (matricule, pin_hash, failed_attempts, locked_until, updated_at)
-            VALUES ($1, $2, 0, NULL, now())
-            ON CONFLICT (matricule) DO UPDATE SET
-                pin_hash = EXCLUDED.pin_hash,
-                failed_attempts = 0,
-                locked_until = NULL,
-                updated_at = now()
-        `, [employee.matricule, pinHash]);
-
-        await global.attendancePool.query(`
-            UPDATE public.self_pointage_pin_tokens SET used_at = now() WHERE id = $1
-        `, [row.id]);
-
-        res.json({ success: true });
-    } catch (error) {
-        console.error('❌ POST /self-pointage/pin/confirm error:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
