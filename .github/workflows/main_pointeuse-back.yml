@@ -83,6 +83,20 @@ jobs:
             --resource-group "$RESOURCE_GROUP" \
             --settings LEAVE_BALANCE_API_KEY="$LEAVE_BALANCE_API_KEY"
 
+      - name: Set SELF_POINTAGE_JWT_SECRET app setting
+        env:
+          SELF_POINTAGE_JWT_SECRET: ${{ secrets.SELF_POINTAGE_JWT_SECRET }}
+        run: |
+          if [ -z "$SELF_POINTAGE_JWT_SECRET" ]; then
+            echo "SELF_POINTAGE_JWT_SECRET secret not set, skipping app setting update"
+            exit 0
+          fi
+          RESOURCE_GROUP=$(az webapp list --query "[?name=='pointeuse-back'].resourceGroup" -o tsv)
+          az webapp config appsettings set \
+            --name pointeuse-back \
+            --resource-group "$RESOURCE_GROUP" \
+            --settings SELF_POINTAGE_JWT_SECRET="$SELF_POINTAGE_JWT_SECRET"
+
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3

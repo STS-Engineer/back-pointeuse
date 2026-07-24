@@ -56,6 +56,12 @@ app.use(missingPointsRoutes);
 const leaveBalanceRoutes = require('./routes/leaveBalance');
 app.use(leaveBalanceRoutes);
 
+const remoteAttendanceRoutes = require('./routes/remoteAttendance');
+app.use(remoteAttendanceRoutes);
+
+const selfPointageRoutes = require('./routes/selfPointage');
+app.use('/api/self-pointage', selfPointageRoutes);
+
 // ── Health check ───────────────────────────────────────────────
 app.get('/health', (req, res) => {
     res.json({
@@ -143,6 +149,40 @@ const server = app.listen(PORT, () => {
     }, { timezone: 'Africa/Tunis' });
 
     console.log(`⏰ Leave-balance accrual cron job scheduled — "${leaveBalanceCronExpr}" (Africa/Tunis)`);
+
+    // ── Remote-work attendance emails (daily, Mon-Fri; no-op unless the day ──
+    // ── has been marked remote via POST /api/remote-days) ────────────────
+    const remoteAttendance = require('./services/remoteAttendance');
+
+    const remoteArrivalCronExpr = process.env.REMOTE_ATTENDANCE_ARRIVAL_CRON || '30 7 * * 1-5';
+    cron.schedule(remoteArrivalCronExpr, async () => {
+        try {
+            const today = remoteAttendance.todayInTz();
+            if (!(await remoteAttendance.isRemoteWorkDay(today))) return;
+            console.log(`\n⏰ [CRON] Sending remote-attendance arrival emails for ${today}`);
+            const result = await remoteAttendance.sendPunchLinksForDate(today, 'arrival', { dryRun: false });
+            console.log(`✅ [CRON] Remote-attendance arrival emails sent: ${JSON.stringify(result)}`);
+        } catch (err) {
+            console.error('❌ [CRON] Remote-attendance arrival sweep failed:', err.message);
+            // ← never crashes the server, just logs the error
+        }
+    }, { timezone: 'Africa/Tunis' });
+
+    const remoteDepartureCronExpr = process.env.REMOTE_ATTENDANCE_DEPARTURE_CRON || '30 16 * * 1-5';
+    cron.schedule(remoteDepartureCronExpr, async () => {
+        try {
+            const today = remoteAttendance.todayInTz();
+            if (!(await remoteAttendance.isRemoteWorkDay(today))) return;
+            console.log(`\n⏰ [CRON] Sending remote-attendance departure emails for ${today}`);
+            const result = await remoteAttendance.sendPunchLinksForDate(today, 'departure', { dryRun: false });
+            console.log(`✅ [CRON] Remote-attendance departure emails sent: ${JSON.stringify(result)}`);
+        } catch (err) {
+            console.error('❌ [CRON] Remote-attendance departure sweep failed:', err.message);
+            // ← never crashes the server, just logs the error
+        }
+    }, { timezone: 'Africa/Tunis' });
+
+    console.log(`⏰ Remote-attendance cron jobs scheduled — arrival "${remoteArrivalCronExpr}", departure "${remoteDepartureCronExpr}" (Africa/Tunis)`);
 });
 
 // ── Graceful shutdown ──────────────────────────────────────────
